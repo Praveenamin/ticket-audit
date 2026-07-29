@@ -1,0 +1,105 @@
+services:
+  db:
+    image: postgres:15-alpine
+    container_name: whmcsaudit_db
+    environment:
+      POSTGRES_DB: ${POSTGRES_DB:-whmcsaudit_db}
+      POSTGRES_USER: ${POSTGRES_USER:-whmcsaudit_user}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-changeme}
+    volumes:
+      - whmcsaudit_postgres_data:/var/lib/postgresql/data
+    ports:
+      - "5434:5432"
+    networks:
+      - whmcsaudit_network
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-whmcsaudit_user}"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  redis:
+    image: redis:7-alpine
+    container_name: whmcsaudit_redis
+    volumes:
+      - whmcsaudit_redis_data:/data
+    ports:
+      - "6380:6379"
+    networks:
+      - whmcsaudit_network
+    restart: unless-stopped
+    command: redis-server --appendonly yes
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  web:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: whmcsaudit_web
+    user: "root"
+    command: >
+      sh -c "
+        python manage.py migrate --noinput &&
+        python manage.py collectstatic --noinput &&
+        exec gunicorn ticket_audit.wsgi:application --bind 0.0.0.0:8000 --workers 4 --timeout 180
+      "
+    volumes:
+      - .:/app
+      - whmcsaudit_static:/app/staticfiles
+    ports:
+      - "8010:8000"
+    env_file:
+      - .env
+    networks:
+      - whmcsaudit_network
+    depends_on:
+      db:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "python", "manage.py", "check"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+
+  scheduler:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: whmcsaudit_scheduler
+    user: "root"
+    command: >
+      sh -c "
+        sleep 15 &&
+        exec python3 audit_scheduler.py
+      "
+    environment:
+      - PYTHONUNBUFFERED=1
+    volumes:
+      - .:/app
+    env_file:
+      - .env
+    networks:
+      - whmcsaudit_network
+    depends_on:
+      db:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    restart: unless-stopped
+
+volumes:
+  whmcsaudit_postgres_data:
+  whmcsaudit_redis_data:
+  whmcsaudit_static:
+
+networks:
+  whmcsaudit_network:
+    driver: bridge
