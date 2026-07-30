@@ -82,15 +82,31 @@ STATIC_URL = "/static/"
 STATIC_ROOT = BASE_DIR / "staticfiles"
 STATICFILES_STORAGE = "whitenoise.storage.CompressedManifestStaticFilesStorage"
 
+MEDIA_URL = "/media/"
+MEDIA_ROOT = BASE_DIR / "media"
+
+# WHMCS dump uploads are 500MB+ -- this is an internal single-admin tool, not
+# public-facing, so disabling Django's default upload-size guard is an
+# acceptable tradeoff for accepting them.
+DATA_UPLOAD_MAX_MEMORY_SIZE = None
+
 DEFAULT_AUTO_FIELD = "django.db.models.BigAutoField"
 
-# WHMCS API
-# REST-style action API at {WHMCS_BASE_URL}/includes/api.php, authenticated with
-# an Identifier/Secret pair created under Setup > API Credentials in WHMCS.
+# WHMCS API (only used by Project rows with source_type="api"; credentials are
+# stored per-project in the DB, these are just fallback defaults for the
+# original Dev project, kept in sync with docker-compose.yml/.env)
 WHMCS_BASE_URL = os.environ.get("WHMCS_BASE_URL", "").rstrip("/")
 WHMCS_API_IDENTIFIER = os.environ.get("WHMCS_API_IDENTIFIER", "")
 WHMCS_API_SECRET = os.environ.get("WHMCS_API_SECRET", "")
 WHMCS_API_TIMEOUT = int(os.environ.get("WHMCS_API_TIMEOUT", "30"))
+
+# Staging MySQL used to transform an uploaded WHMCS dump before deriving this
+# app's own Postgres-backed models -- internal-only service, see
+# docker-compose.yml's `staging_db`.
+STAGING_DB_HOST = os.environ.get("STAGING_DB_HOST", "staging_db")
+STAGING_DB_PORT = int(os.environ.get("STAGING_DB_PORT", "3306"))
+STAGING_DB_ROOT_USER = os.environ.get("STAGING_DB_ROOT_USER", "root")
+STAGING_DB_ROOT_PASSWORD = os.environ.get("STAGING_DB_ROOT_PASSWORD", "staging")
 
 # Ollama (added in Phase 2 for AI-assisted rubric scoring)
 OLLAMA_API_URL = os.environ.get("OLLAMA_API_URL", "http://ollama:11434")

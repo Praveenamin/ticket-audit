@@ -1,5 +1,10 @@
 """WHMCS -> local ticket sync. Thin management command delegates here (fat
-service-module split, matching calculate_sli_compliance.py's convention)."""
+service-module split, matching calculate_sli_compliance.py's convention).
+
+Project-scoped: every row this writes is tagged with the Project it came from,
+so multiple WHMCS instances' data never mixes (see audit/dump_import.py for
+the DB-dump-based counterpart to this same ingestion shape).
+"""
 
 import logging
 from datetime import datetime, timedelta, timezone as dt_timezone
@@ -13,8 +18,8 @@ from .whmcs_client import WHMCSClient
 logger = logging.getLogger("audit")
 
 # WHMCS timestamps are plain 'YYYY-MM-DD HH:MM:SS' strings with no timezone info.
-# Confirmed with Praveen (2026-07-28): this WHMCS instance's admin timezone is IST
-# (UTC+5:30, no DST) -- a fixed offset is exact, no zoneinfo/tzdata needed.
+# Confirmed with Praveen (2026-07-28): the Dev WHMCS instance's admin timezone is
+# IST (UTC+5:30, no DST) -- a fixed offset is exact, no zoneinfo/tzdata needed.
 WHMCS_TZ = dt_timezone(timedelta(hours=5, minutes=30))
 
 
@@ -25,11 +30,11 @@ def _parse_whmcs_dt(value):
     return naive.replace(tzinfo=WHMCS_TZ).astimezone(dt_timezone.utc)
 
 
-def _upsert_department(deptid, deptname):
+def _upsert_department(project, deptid, deptname):
     if not deptid:
         return None
     department, _ = Department.objects.update_or_create(
-        whmcs_deptid=deptid,
+        project=project, whmcs_deptid=deptid,
         defaults={"name": deptname or f"Department {deptid}", "last_seen_at": timezone.now()},
     )
     return department
@@ -61,17 +66,19 @@ def _upsert_replies(ticket, replies_payload):
     return first_response_at
 
 
-def _sync_one_ticket(client, summary):
+def _sync_one_ticket(project, client, summary):
     whmcs_ticket_id = summary["id"]
     last_reply_at = _parse_whmcs_dt(summary.get("lastreply"))
 
-    existing = TicketSnapshot.objects.filter(whmcs_ticket_id=whmcs_ticket_id).first()
+    existing = TicketSnapshot.objects.filter(
+        project=project, whmcs_ticket_id=whmcs_ticket_id,
+    ).first()
     needs_full_refresh = existing is None or existing.last_reply_at != last_reply_at
 
-    department = _upsert_department(summary.get("deptid"), summary.get("deptname"))
+    department = _upsert_department(project, summary.get("deptid"), summary.get("deptname"))
 
     ticket, _ = TicketSnapshot.objects.update_or_create(
-        whmcs_ticket_id=whmcs_ticket_id,
+        project=project, whmcs_ticket_id=whmcs_ticket_id,
         defaults={
             "tid": summary.get("tid", ""),
             "department": department,
@@ -106,17 +113,24 @@ def _sync_one_ticket(client, summary):
     return ticket
 
 
-def sync_tickets():
-    """Pages through GetTickets and upserts each ticket in its own try/except
-    (per-item isolation, matching run_synthetic_checks.py) so one bad ticket
-    can't abort the whole pass. Returns (synced_count, errored_count)."""
-    client = WHMCSClient()
+def sync_tickets(project):
+    """Pages through GetTickets for one API-sourced Project and upserts each
+    ticket in its own try/except (per-item isolation, matching
+    run_synthetic_checks.py) so one bad ticket can't abort the whole pass.
+    Returns (synced_count, errored_count)."""
+    client = WHMCSClient(
+        base_url=project.whmcs_base_url,
+        identifier=project.whmcs_api_identifier,
+        secret=project.whmcs_api_secret,
+    )
     synced, errored = 0, 0
     for summary in client.iter_tickets():
         try:
-            _sync_one_ticket(client, summary)
+            _sync_one_ticket(project, client, summary)
             synced += 1
         except Exception:
             errored += 1
-            logger.exception("Failed to sync WHMCS ticket %s", summary.get("id"))
+            logger.exception(
+                "Failed to sync WHMCS ticket %s for project %s", summary.get("id"), project.name
+            )
     return synced, errored

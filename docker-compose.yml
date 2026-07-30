@@ -36,6 +36,26 @@ services:
       timeout: 5s
       retries: 5
 
+  staging_db:
+    image: mysql:8.0
+    container_name: whmcsaudit_staging_db
+    command: --default-authentication-plugin=mysql_native_password
+    environment:
+      MYSQL_ROOT_PASSWORD: ${STAGING_DB_ROOT_PASSWORD:-staging}
+    volumes:
+      - whmcsaudit_staging_data:/var/lib/mysql
+    # Internal only -- no host port published, same pattern as the (unused
+    # here) ollama service in the sibling StackSense project. Used to stage
+    # WHMCS dump uploads for transformation, never reachable from outside.
+    networks:
+      - whmcsaudit_network
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "mysqladmin", "ping", "-h", "localhost", "-uroot", "-p${STAGING_DB_ROOT_PASSWORD:-staging}"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+
   web:
     build:
       context: .
@@ -46,11 +66,12 @@ services:
       sh -c "
         python manage.py migrate --noinput &&
         python manage.py collectstatic --noinput &&
-        exec gunicorn ticket_audit.wsgi:application --bind 0.0.0.0:8000 --workers 4 --timeout 180
+        exec gunicorn ticket_audit.wsgi:application --bind 0.0.0.0:8000 --workers 4 --timeout 600
       "
     volumes:
       - .:/app
       - whmcsaudit_static:/app/staticfiles
+      - whmcsaudit_media:/app/media
     ports:
       - "8010:8000"
     env_file:
@@ -84,6 +105,7 @@ services:
       - PYTHONUNBUFFERED=1
     volumes:
       - .:/app
+      - whmcsaudit_media:/app/media
     env_file:
       - .env
     networks:
@@ -93,12 +115,16 @@ services:
         condition: service_healthy
       redis:
         condition: service_healthy
+      staging_db:
+        condition: service_healthy
     restart: unless-stopped
 
 volumes:
   whmcsaudit_postgres_data:
   whmcsaudit_redis_data:
   whmcsaudit_static:
+  whmcsaudit_media:
+  whmcsaudit_staging_data:
 
 networks:
   whmcsaudit_network:

@@ -10,12 +10,20 @@ from datetime import timedelta
 from django.test import TestCase
 from django.utils import timezone
 
-from .models import Department, SLAPolicy, TicketReply, TicketSnapshot
+from .models import Department, Project, SLAPolicy, TicketReply, TicketSnapshot
 from .sla import apply_sla_evaluation, evaluate_reply_turnaround, explain_sla, resolve_policy
+
+
+def make_project(name="Test Project", **overrides):
+    defaults = {"source_type": Project.SOURCE_DUMP}
+    defaults.update(overrides)
+    project, _ = Project.objects.get_or_create(name=name, defaults=defaults)
+    return project
 
 
 def make_ticket(**overrides):
     defaults = {
+        "project": make_project(),
         "whmcs_ticket_id": 1,
         "tid": "T-1",
         "subject": "test",
@@ -42,47 +50,71 @@ def make_reply(ticket, author_type, posted_at, reply_id, message="msg"):
 
 class PolicyPrecedenceTests(TestCase):
     """resolve_policy: department-specific beats the global (department-null)
-    default."""
+    default, scoped per project."""
 
     def setUp(self):
-        self.cpanel = Department.objects.create(whmcs_deptid=1, name="cPanel")
-        self.linux = Department.objects.create(whmcs_deptid=2, name="Linux")
+        self.project = make_project("Project A")
+        self.other_project = make_project("Project B")
+        self.cpanel = Department.objects.create(project=self.project, whmcs_deptid=1, name="cPanel")
+        self.linux = Department.objects.create(project=self.project, whmcs_deptid=2, name="Linux")
 
     def test_no_policies_returns_none(self):
-        self.assertIsNone(resolve_policy(self.cpanel.id))
+        self.assertIsNone(resolve_policy(self.project.id, self.cpanel.id))
 
     def test_global_default_used_when_nothing_more_specific(self):
         global_policy = SLAPolicy.objects.create(
-            name="Global", first_response_target_minutes=60, resolution_target_minutes=1440,
+            project=self.project, name="Global",
+            first_response_target_minutes=60, resolution_target_minutes=1440,
         )
-        self.assertEqual(resolve_policy(self.cpanel.id), global_policy)
+        self.assertEqual(resolve_policy(self.project.id, self.cpanel.id), global_policy)
 
     def test_department_specific_beats_global_default(self):
         SLAPolicy.objects.create(
-            name="Global", first_response_target_minutes=60, resolution_target_minutes=1440,
+            project=self.project, name="Global",
+            first_response_target_minutes=60, resolution_target_minutes=1440,
         )
         dept_only = SLAPolicy.objects.create(
-            name="cPanel dept", department=self.cpanel,
+            project=self.project, name="cPanel dept", department=self.cpanel,
             first_response_target_minutes=20, resolution_target_minutes=480,
         )
-        self.assertEqual(resolve_policy(self.cpanel.id), dept_only)
+        self.assertEqual(resolve_policy(self.project.id, self.cpanel.id), dept_only)
 
     def test_wrong_department_does_not_match(self):
         SLAPolicy.objects.create(
-            name="cPanel dept", department=self.cpanel,
+            project=self.project, name="cPanel dept", department=self.cpanel,
             first_response_target_minutes=20, resolution_target_minutes=480,
         )
-        self.assertIsNone(resolve_policy(self.linux.id))
+        self.assertIsNone(resolve_policy(self.project.id, self.linux.id))
 
     def test_tie_broken_by_most_recently_created(self):
         older = SLAPolicy.objects.create(
-            name="Global A", first_response_target_minutes=60, resolution_target_minutes=1440,
+            project=self.project, name="Global A",
+            first_response_target_minutes=60, resolution_target_minutes=1440,
         )
         newer = SLAPolicy.objects.create(
-            name="Global B", first_response_target_minutes=45, resolution_target_minutes=900,
+            project=self.project, name="Global B",
+            first_response_target_minutes=45, resolution_target_minutes=900,
         )
-        self.assertEqual(resolve_policy(self.cpanel.id), newer)
-        self.assertNotEqual(resolve_policy(self.cpanel.id), older)
+        self.assertEqual(resolve_policy(self.project.id, self.cpanel.id), newer)
+        self.assertNotEqual(resolve_policy(self.project.id, self.cpanel.id), older)
+
+    def test_global_policy_in_one_project_does_not_leak_into_another(self):
+        SLAPolicy.objects.create(
+            project=self.project, name="Global (Project A)",
+            first_response_target_minutes=60, resolution_target_minutes=1440,
+        )
+        other_dept = Department.objects.create(
+            project=self.other_project, whmcs_deptid=1, name="Support",
+        )
+        self.assertIsNone(resolve_policy(self.other_project.id, other_dept.id))
+
+    def test_same_whmcs_deptid_in_different_projects_does_not_collide(self):
+        # cpanel already has whmcs_deptid=1 under self.project.
+        other_dept = Department.objects.create(
+            project=self.other_project, whmcs_deptid=1, name="Same ID, different project",
+        )
+        self.assertNotEqual(other_dept.project_id, self.cpanel.project_id)
+        self.assertEqual(other_dept.whmcs_deptid, self.cpanel.whmcs_deptid)
 
 
 class SLAEvaluationTests(TestCase):
@@ -91,6 +123,7 @@ class SLAEvaluationTests(TestCase):
 
     def setUp(self):
         self.policy = SLAPolicy.objects.create(
+            project=make_project(),
             name="Standard",
             first_response_target_minutes=60,
             resolution_target_minutes=240,

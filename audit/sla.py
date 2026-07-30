@@ -34,12 +34,14 @@ SLA_FIELDS = [
 _TAG_RE = re.compile(r"<[^>]+>")
 
 
-def resolve_policy(department_id):
+def resolve_policy(project_id, department_id):
     """Most-specific-wins precedence: department-specific beats the global
-    (department-null) default. Ties broken by most recently created policy."""
+    (department-null) default. Ties broken by most recently created policy.
+    Scoped to `project_id` first -- a global policy in one project must never
+    apply to another project's tickets."""
     candidates = [
         policy
-        for policy in SLAPolicy.objects.filter(active=True)
+        for policy in SLAPolicy.objects.filter(project_id=project_id, active=True)
         if policy.matches(department_id)
     ]
     if not candidates:
@@ -198,7 +200,7 @@ def explain_sla(ticket, replies=None, now=None):
 
 def apply_sla_evaluation(ticket: TicketSnapshot, now=None):
     now = now or timezone.now()
-    policy = resolve_policy(ticket.department_id)
+    policy = resolve_policy(ticket.project_id, ticket.department_id)
 
     ticket.sla_policy = policy
 

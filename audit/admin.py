@@ -5,7 +5,7 @@ from django.urls import reverse
 from django.utils import timezone
 from django.utils.html import format_html, format_html_join
 
-from .models import Department, SLAPolicy, TicketReply, TicketSnapshot
+from .models import Department, DumpUpload, Project, SLAPolicy, TicketReply, TicketSnapshot
 from .sla import explain_sla
 
 
@@ -61,26 +61,71 @@ class ReadOnlyAdminMixin:
         return False
 
 
+@admin.register(Project)
+class ProjectAdmin(admin.ModelAdmin):
+    """The WHMCS API fields only apply to source_type="api" projects -- the
+    JS toggles them out of the form for "dump" projects (default and initial
+    state on Add) since they'd otherwise be a confusing, unused prompt."""
+
+    list_display = ("name", "source_type", "active", "created_at")
+    list_filter = ("source_type", "active")
+
+    class Media:
+        js = ("audit/js/project_admin.js",)
+
+
 @admin.register(Department)
 class DepartmentAdmin(ReadOnlyAdminMixin, admin.ModelAdmin):
-    list_display = ("name", "whmcs_deptid", "last_seen_at")
-    ordering = ("name",)
+    list_display = ("name", "project", "whmcs_deptid", "last_seen_at")
+    list_filter = ("project",)
+    ordering = ("project__name", "name")
 
 
 @admin.register(SLAPolicy)
 class SLAPolicyAdmin(admin.ModelAdmin):
     list_display = (
-        "name", "department",
+        "name", "project", "department",
         "first_response_target_minutes", "resolution_target_minutes", "active",
     )
-    list_filter = ("active", "department")
+    list_filter = ("active", "project", "department")
 
     def get_readonly_fields(self, request, obj=None):
-        # Department is chosen when a policy is created but fixed after that --
-        # reassigning it later would silently change which tickets it scores.
+        # Project/department are chosen when a policy is created but fixed
+        # after that -- reassigning either later would silently change which
+        # tickets it scores.
         if obj is None:
             return ()
-        return ("department",)
+        return ("project", "department")
+
+
+@admin.register(DumpUpload)
+class DumpUploadAdmin(admin.ModelAdmin):
+    """Upload IS the ingestion trigger (admin's default add-form gives us the
+    project dropdown + file picker for free); the record becomes an immutable
+    processing-status log entry once created -- its list/detail view is the
+    status page (status/counts/error), refreshed by reloading the page."""
+
+    list_display = ("project", "status", "uploaded_at", "finished_at", "tickets_imported")
+    list_filter = ("status", "project")
+
+    def get_fields(self, request, obj=None):
+        if obj is None:
+            return ("project", "file")
+        return (
+            "project", "file", "status", "uploaded_at", "started_at", "finished_at",
+            "tickets_imported", "error_message",
+        )
+
+    def get_readonly_fields(self, request, obj=None):
+        if obj is None:
+            return ()
+        return (
+            "project", "file", "status", "uploaded_at", "started_at", "finished_at",
+            "tickets_imported", "error_message",
+        )
+
+    def has_change_permission(self, request, obj=None):
+        return False
 
 
 class TicketReplyInline(admin.TabularInline):
@@ -97,9 +142,9 @@ class TicketReplyInline(admin.TabularInline):
 @admin.register(TicketSnapshot)
 class TicketSnapshotAdmin(ReadOnlyAdminMixin, admin.ModelAdmin):
     list_display = (
-        "tid", "subject", "department", "priority", "status", "sla_status_badge",
+        "tid", "subject", "project", "department", "priority", "status", "sla_status_badge",
     )
-    list_filter = (TicketOpenedDateFilter, "sla_status", "department", "priority", "status")
+    list_filter = (TicketOpenedDateFilter, "sla_status", "project", "department", "priority", "status")
     search_fields = ("tid", "subject", "requestor_name", "requestor_email")
     readonly_fields = ("breach_explanation",)
     inlines = [TicketReplyInline]

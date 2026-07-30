@@ -2,14 +2,24 @@ from django.db import models
 from django.utils import timezone
 
 
-class Department(models.Model):
-    """Lightweight cache of WHMCS support departments, upserted at sync time from
-    ticket payloads (the GetSupportDepartments API action is blocked by our
-    credential's role, so we never call it directly)."""
+class Project(models.Model):
+    """One audited WHMCS instance/company. Departments, SLA policies, and
+    tickets are all scoped to a project so multiple WHMCS sources never mix."""
 
-    whmcs_deptid = models.PositiveIntegerField(unique=True)
-    name = models.CharField(max_length=255)
-    last_seen_at = models.DateTimeField(default=timezone.now)
+    SOURCE_API = "api"
+    SOURCE_DUMP = "dump"
+    SOURCE_CHOICES = [
+        (SOURCE_API, "WHMCS API"),
+        (SOURCE_DUMP, "DB dump upload"),
+    ]
+
+    name = models.CharField(max_length=255, unique=True)
+    source_type = models.CharField(max_length=10, choices=SOURCE_CHOICES, default=SOURCE_DUMP)
+    whmcs_base_url = models.CharField(max_length=255, blank=True)
+    whmcs_api_identifier = models.CharField(max_length=255, blank=True)
+    whmcs_api_secret = models.CharField(max_length=255, blank=True)
+    active = models.BooleanField(default=True)
+    created_at = models.DateTimeField(auto_now_add=True)
 
     class Meta:
         ordering = ["name"]
@@ -18,11 +28,30 @@ class Department(models.Model):
         return self.name
 
 
+class Department(models.Model):
+    """Lightweight cache of WHMCS support departments, upserted at ingest time
+    (from either the API sync or a dump import), scoped per project."""
+
+    project = models.ForeignKey(Project, on_delete=models.CASCADE, related_name="departments")
+    whmcs_deptid = models.PositiveIntegerField()
+    name = models.CharField(max_length=255)
+    last_seen_at = models.DateTimeField(default=timezone.now)
+
+    class Meta:
+        ordering = ["project__name", "name"]
+        unique_together = [("project", "whmcs_deptid")]
+
+    def __str__(self):
+        return f"{self.name} ({self.project.name})"
+
+
 class SLAPolicy(models.Model):
+    project = models.ForeignKey(Project, on_delete=models.CASCADE, related_name="sla_policies")
     name = models.CharField(max_length=255)
     department = models.ForeignKey(
         Department, null=True, blank=True, on_delete=models.CASCADE, related_name="sla_policies",
-        help_text="Leave blank to apply to all departments. Fixed once the policy is created.",
+        help_text="Leave blank to apply to all departments in this project. "
+        "Fixed once the policy is created.",
     )
     first_response_target_minutes = models.PositiveIntegerField()
     resolution_target_minutes = models.PositiveIntegerField()
@@ -35,7 +64,7 @@ class SLAPolicy(models.Model):
 
     def __str__(self):
         scope = self.department.name if self.department_id else "All departments"
-        return f"{self.name} ({scope})"
+        return f"{self.name} ({self.project.name} / {scope})"
 
     def specificity_rank(self):
         """Precedence when multiple policies match the same ticket:
@@ -55,7 +84,8 @@ class TicketSnapshot(models.Model):
     ]
     ON_HOLD_STATUS = "On Hold"
 
-    whmcs_ticket_id = models.PositiveIntegerField(unique=True)
+    project = models.ForeignKey(Project, on_delete=models.CASCADE, related_name="tickets")
+    whmcs_ticket_id = models.PositiveIntegerField()
     tid = models.CharField(max_length=50, blank=True)
     department = models.ForeignKey(
         Department, null=True, blank=True, on_delete=models.SET_NULL, related_name="tickets",
@@ -74,8 +104,8 @@ class TicketSnapshot(models.Model):
     )
     closed_at = models.DateTimeField(
         null=True, blank=True,
-        help_text="Set the first time a sync observes status=Closed; may lag real "
-        "closure by up to one sync interval.",
+        help_text="Set the first time an ingest observes status=Closed; may lag real "
+        "closure by up to one sync/import interval.",
     )
     synced_at = models.DateTimeField(default=timezone.now)
 
@@ -99,6 +129,7 @@ class TicketSnapshot(models.Model):
 
     class Meta:
         ordering = ["-last_reply_at"]
+        unique_together = [("project", "whmcs_ticket_id")]
 
     def __str__(self):
         return f"#{self.tid or self.whmcs_ticket_id} - {self.subject}"
@@ -123,3 +154,35 @@ class TicketReply(models.Model):
 
     def __str__(self):
         return f"Reply {self.whmcs_reply_id} on ticket {self.ticket_id}"
+
+
+class DumpUpload(models.Model):
+    """One uploaded WHMCS DB dump and its background-processing lifecycle.
+    Immutable once created (admin denies edit/delete) -- it's a log entry, not
+    a configuration object."""
+
+    STATUS_QUEUED = "queued"
+    STATUS_PROCESSING = "processing"
+    STATUS_DONE = "done"
+    STATUS_FAILED = "failed"
+    STATUS_CHOICES = [
+        (STATUS_QUEUED, "Queued"),
+        (STATUS_PROCESSING, "Processing"),
+        (STATUS_DONE, "Done"),
+        (STATUS_FAILED, "Failed"),
+    ]
+
+    project = models.ForeignKey(Project, on_delete=models.CASCADE, related_name="dump_uploads")
+    file = models.FileField(upload_to="whmcs_dumps/")
+    status = models.CharField(max_length=20, choices=STATUS_CHOICES, default=STATUS_QUEUED)
+    uploaded_at = models.DateTimeField(auto_now_add=True)
+    started_at = models.DateTimeField(null=True, blank=True)
+    finished_at = models.DateTimeField(null=True, blank=True)
+    tickets_imported = models.PositiveIntegerField(null=True, blank=True)
+    error_message = models.TextField(blank=True)
+
+    class Meta:
+        ordering = ["-uploaded_at"]
+
+    def __str__(self):
+        return f"{self.project.name} dump ({self.uploaded_at:%Y-%m-%d %H:%M}) - {self.status}"
