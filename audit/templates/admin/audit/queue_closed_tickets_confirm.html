@@ -1,0 +1,25 @@
+{% extends "admin/base_site.html" %}
+
+{% block content_title %}{{ title }}{% endblock %}
+
+{% block content %}
+  <p>Queue AI summaries for <strong>{{ project.name }}</strong>'s Closed tickets
+     between {{ date_from }} and {{ date_to }}?</p>
+
+  {% if pending == 0 %}
+    <p>Every closed ticket in this window already has a summary (or there are none in range) --
+       nothing to queue.</p>
+    <a href="{{ report_url }}" class="btn btn-secondary">Back to report</a>
+  {% else %}
+    <p><strong>{{ pending }}</strong> ticket(s) in this window don't have a summary yet.
+       They're processed <strong>one at a time</strong> by the background scheduler --
+       at the current average speed, that's roughly <strong>{{ eta_hours }} hour(s)</strong> total.
+       While it works through this backlog, the scheduler's other jobs (WHMCS sync, SLA checks,
+       etc.) will be delayed, since it's a single sequential queue, not parallel workers.</p>
+    <form method="post" class="d-flex gap-3">
+      {% csrf_token %}
+      <button type="submit" class="btn btn-primary">Queue {{ pending }} ticket(s)</button>
+      <a href="{{ report_url }}" class="btn btn-secondary">Cancel</a>
+    </form>
+  {% endif %}
+{% endblock %}

@@ -11,7 +11,7 @@ INSTALLED_APPS = [
     "jazzmin",
     "audit",
     "django.contrib.admin",
-    "django.contrib.auth",
+    "audit.apps.UserManagementConfig",
     "django.contrib.contenttypes",
     "django.contrib.sessions",
     "django.contrib.messages",
@@ -37,7 +37,10 @@ LOGIN_URL = "/admin/login/"
 TEMPLATES = [
     {
         "BACKEND": "django.template.backends.django.DjangoTemplates",
-        "DIRS": [],
+        # Checked before any app's own bundled templates (including
+        # jazzmin's, which is listed before "audit" in INSTALLED_APPS) --
+        # lets templates/admin/filter.html override Jazzmin's own copy.
+        "DIRS": [BASE_DIR / "templates"],
         "APP_DIRS": True,
         "OPTIONS": {
             "context_processors": [
@@ -74,7 +77,10 @@ AUTH_PASSWORD_VALIDATORS = [
 ]
 
 LANGUAGE_CODE = "en-us"
-TIME_ZONE = "UTC"
+# Data is stored in UTC regardless (USE_TZ=True); this only controls display
+# conversion -- the business and every ticket timestamp we compare against
+# (WHMCS is IST) is India-based, so admin-rendered datetimes should read IST.
+TIME_ZONE = "Asia/Kolkata"
 USE_I18N = True
 USE_TZ = True
 
@@ -111,7 +117,14 @@ STAGING_DB_ROOT_PASSWORD = os.environ.get("STAGING_DB_ROOT_PASSWORD", "staging")
 # Ollama (added in Phase 2 for AI-assisted rubric scoring)
 OLLAMA_API_URL = os.environ.get("OLLAMA_API_URL", "http://ollama:11434")
 OLLAMA_MODEL = os.environ.get("OLLAMA_MODEL", "llama3.2:latest")
-OLLAMA_TIMEOUT = int(os.environ.get("OLLAMA_TIMEOUT", "120"))
+OLLAMA_TIMEOUT = int(os.environ.get("OLLAMA_TIMEOUT", "600"))
+
+# Auto-queue window for Closed Tickets Summary -- intentionally narrow at
+# first launch (Aug 2026); widen via this env var/setting without a code
+# change, not by hardcoding the window anywhere else.
+CLOSED_TICKET_SUMMARY_QUEUE_WINDOW_DAYS = int(
+    os.environ.get("CLOSED_TICKET_SUMMARY_QUEUE_WINDOW_DAYS", "3")
+)
 
 # Redis
 REDIS_URL = os.environ.get("REDIS_URL", "redis://redis:6379/0")
@@ -165,11 +178,107 @@ JAZZMIN_SETTINGS = {
     "site_title": "WHMCS Ticket Audit",
     "site_header": "Ticket Audit",
     "site_brand": "Ticket Audit",
-    "theme": "dark",
+    # Global navbar search, next to the sidebar-toggle hamburger -- same
+    # spot and same "always there" behavior on every page, not just the
+    # Ticket Snapshots changelist's own (now-hidden, see search_form.html)
+    # inline search box. Searches TicketSnapshotAdmin.search_fields (tid,
+    # subject, requestor name/email).
+    "search_model": "audit.TicketSnapshot",
+    # Was "dark" (not a real theme name -- silently fell back to "default")
+    # then briefly corrected to "darkly" -- reverted back to "default" (the
+    # light theme this app has actually been running/tuned against) per
+    # explicit request. Only the sidebar/navbar are dark, via UI-tweaks below.
+    "theme": "default",
     "welcome_sign": "Welcome to the WHMCS Ticket Audit System",
     "copyright": "Ticket Audit",
     "show_sidebar": True,
     "navigation_expanded": True,
-    "order_with_respect_to": ["auth", "audit"],
+    # "Reports" isn't an installed app -- it's the custom_links key below,
+    # which Jazzmin still treats as a sortable top-level sidebar group. The
+    # audit.* entries order that app's own models (Jazzmin matches both the
+    # bare app label and "app.model" prefixes out of this same list).
+    "order_with_respect_to": [
+        "audit", "audit.project", "audit.slapolicy", "audit.client", "audit.department",
+        "audit.closedticketsummary", "Reports", "auth",
+    ],
     "changeform_format": "horizontal_tabs",
+    # Ticket Snapshots is reached via "Dashboard" now, and Dump Uploads is
+    # managed from within its Project (ProjectAdmin.upload_dump_link +
+    # DumpUploadInline) -- hiding both from the Audit app's own sidebar list
+    # so they aren't listed twice. Still fully functional (admin registration
+    # untouched), just not in this menu.
+    "hide_models": ["audit.ticketsnapshot", "audit.dumpupload"],
+    # Without this, every Audit-app sidebar entry falls back to Jazzmin's
+    # generic default (a plain dot) -- distinct, purpose-matched icons per
+    # model, one visual signature borrowed from the Stack Alert reference
+    # design's sidebar (grouped sections, each row with its own crisp icon
+    # rather than a repeated placeholder glyph).
+    "icons": {
+        "audit.project": "fas fa-building",
+        "audit.slapolicy": "fas fa-gauge-high",
+        "audit.client": "fas fa-user-tie",
+        "audit.department": "fas fa-sitemap",
+        "audit.closedticketsummary": "fas fa-robot",
+        "audit.ticketaudit": "fas fa-magnifying-glass-chart",
+    },
+    # "Reports" doesn't match any installed app label, so Jazzmin renders it
+    # as its own sidebar group rather than appending to an existing one.
+    # The dict key IS the displayed sidebar-group label verbatim (Jazzmin
+    # applies no capitalization) -- confirmed via the rendered HTML, which is
+    # why this must be spelled exactly as it should appear, not lowercased.
+    "custom_links": {
+        "Reports": [
+            {
+                "name": "Client Monthly Report",
+                "url": "admin:audit_report_clients",
+                "icon": "fas fa-users",
+            },
+            {
+                "name": "Tech Monthly Report",
+                "url": "admin:audit_report_techs",
+                "icon": "fas fa-user-cog",
+            },
+            {
+                "name": "Top Tickets by Replies",
+                "url": "admin:audit_report_top_tickets",
+                "icon": "fas fa-fire",
+            },
+            {
+                "name": "Closed Tickets Summary",
+                "url": "admin:audit_report_closed_tickets",
+                "icon": "fas fa-clipboard-check",
+            },
+            {
+                "name": "Client Satisfaction Ratings",
+                "url": "admin:audit_report_ratings",
+                "icon": "fas fa-star",
+            },
+        ],
+    },
+    # Re-themed to match StackSense's design tokens (Inter/JetBrains Mono,
+    # sky-blue primary, slate-900 sidebar) -- see the CSS file for the
+    # actual color/font values.
+    "custom_css": "audit/css/stacksense_theme.css",
+    # Moves the logged-in username from the sidebar's user-panel (hidden via
+    # CSS below) to visible text next to the top-right user-menu icon.
+    "custom_js": "audit/js/navbar_user.js",
+    "use_google_fonts_cdn": False,  # the custom CSS supplies Inter/JetBrains Mono itself
+}
+
+JAZZMIN_UI_TWEAKS = {
+    # No navbar override -- the navbar template renders bg-body (light,
+    # matching the "default" theme above), and "navbar-dark" sets icon/text
+    # color to near-white for a DARK background, fighting it -- confirmed via
+    # adminlte.min.css: that's exactly why the top-right user icon vanished
+    # (white on white). Bootstrap 5 here doesn't even ship .navbar-light --
+    # the plain, unmodified .navbar already defaults to dark-on-light colors.
+    "sidebar": "sidebar-dark-primary",
+    "accent": "accent-primary",
+    # A second, independent "theme" setting from JAZZMIN_SETTINGS["theme"]
+    # above -- get_ui_tweaks() reads its OWN copy from here and silently
+    # defaults to "default" (light) if this key is absent, regardless of
+    # what JAZZMIN_SETTINGS says. This is what the body's "theme-*" class
+    # and the bootswatch <link> actually key off. Reverted to "default"
+    # alongside the other one -- see comment there.
+    "theme": "default",
 }

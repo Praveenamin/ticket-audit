@@ -1,0 +1,20 @@
+{% extends "admin/base_site.html" %}
+
+{% block content_title %}{{ title }}{% endblock %}
+
+{% block content %}
+  {% if in_flight %}
+    <p>An AI audit is already {{ in_flight.get_status_display|lower }} for this ticket
+       (requested {{ in_flight.requested_at }}). Wait for it to finish, then refresh the ticket page.</p>
+  {% else %}
+    <p>Run an LLM-based audit (sentiment, missed queries, positives/negatives) for
+       ticket #{{ ticket.tid|default:ticket.whmcs_ticket_id }} -- "{{ ticket.subject }}"?</p>
+    <p>This calls a local Ollama model and can take several minutes on longer threads; you'll be
+       redirected back to the ticket immediately and will need to refresh to see progress.</p>
+  {% endif %}
+  <form method="post" class="d-flex gap-3">
+    {% csrf_token %}
+    <button type="submit" class="btn btn-primary" {% if in_flight %}disabled{% endif %}>Run AI Audit</button>
+    <a href="{{ change_url }}" class="btn btn-secondary">Cancel</a>
+  </form>
+{% endblock %}

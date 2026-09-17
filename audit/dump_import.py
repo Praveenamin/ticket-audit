@@ -17,12 +17,15 @@ import pymysql
 from django.conf import settings
 from django.utils import timezone
 
-from .models import Department, DumpUpload, TicketReply, TicketSnapshot
+from .models import Client, Department, DumpUpload, TicketNote, TicketReply, TicketSnapshot
 from .sla import apply_sla_evaluation
+from .tid_format import format_tid
 
 logger = logging.getLogger("audit")
 
-WANTED_TABLES = {"tbltickets", "tblticketreplies", "tblticketdepartments"}
+WANTED_TABLES = {
+    "tbltickets", "tblticketreplies", "tblticketnotes", "tblticketdepartments", "tblclients",
+}
 _TABLE_RE = re.compile(r"^-- Table structure for table `([^`]+)`")
 
 # Assumption, not yet independently verified for production dumps: same admin
@@ -65,9 +68,9 @@ def _safe_dt(value):
 
 def _extract_subset(dump_path, subset_path):
     """Pull only the tables we need out of the full dump -- same approach as
-    whmcs_ticket_export/extract_tables.py. We don't need tblclients/
-    tblcontacts here: unlike the PDF task, the audit app never needs client
-    identity, only department/ticket/reply data."""
+    whmcs_ticket_export/extract_tables.py. tblclients gives us the account
+    name (tbltickets.name is often blank for an already-logged-in client);
+    we still don't need tblcontacts, unlike the PDF task."""
     capturing = False
     kept = set()
     with open(dump_path, "r", encoding="utf-8", errors="replace") as f_in, open(
@@ -151,6 +154,37 @@ def _import_departments(project, conn):
     return id_map
 
 
+def client_display_name(companyname, firstname, lastname, client_id):
+    """companyname wins if set; else "firstname lastname"; else a fallback
+    naming the raw id so a genuinely blank account is still distinguishable
+    from "(unknown)" (the no-account-linked case in reports.py). Truncated
+    to Client.name's max_length -- real data has hit companyname values
+    over 1200 chars (garbage, not a real name, but ingest can't crash on
+    it either way)."""
+    company = (companyname or "").strip()
+    full_name = f"{firstname or ''} {lastname or ''}".strip()
+    name = company or full_name or f"Client {client_id}"
+    return name[:500]
+
+
+def _import_clients(project, conn):
+    id_map = {}
+    with conn.cursor() as cur:
+        cur.execute("SELECT id, firstname, lastname, companyname, email FROM tblclients")
+        for row in cur.fetchall():
+            name = client_display_name(row["companyname"], row["firstname"], row["lastname"], row["id"])
+            client, _ = Client.objects.update_or_create(
+                project=project, whmcs_client_id=row["id"],
+                defaults={
+                    "name": name,
+                    "email": row["email"] or "",
+                    "last_seen_at": timezone.now(),
+                },
+            )
+            id_map[row["id"]] = client
+    return id_map
+
+
 def _import_replies_for_ticket(ticket, conn, ticket_row):
     """Mirrors sync.py's _upsert_replies: the ticket's own opening message
     becomes reply id '0' (matching the API's convention), followed by every
@@ -171,7 +205,7 @@ def _import_replies_for_ticket(ticket, conn, ticket_row):
     first_response_at = None
     with conn.cursor() as cur:
         cur.execute(
-            "SELECT id, name, email, date, message, admin, contactid "
+            "SELECT id, name, email, date, message, admin, contactid, rating "
             "FROM tblticketreplies WHERE tid = %s ORDER BY date ASC",
             (ticket_row["id"],),
         )
@@ -187,6 +221,7 @@ def _import_replies_for_ticket(ticket, conn, ticket_row):
                     "author_type": author_type,
                     "admin_name": reply_row["admin"] or "",
                     "message": reply_row["message"] or "",
+                    "rating": reply_row["rating"],
                     "posted_at": posted_at,
                 },
             )
@@ -196,11 +231,35 @@ def _import_replies_for_ticket(ticket, conn, ticket_row):
     return first_response_at
 
 
-def _import_tickets(project, conn, dept_map):
+def _import_notes_for_ticket(ticket, conn, ticket_id):
+    """Confirmed against a real production dump (2026-08-08 az_clientPortal
+    dump, preserved after it failed on this exact query): tblticketnotes's
+    ticket-reference column is `ticketid`, not `tid` like tblticketreplies --
+    the original guess here was wrong about that one column name."""
+    with conn.cursor() as cur:
+        cur.execute(
+            "SELECT id, date, admin, message FROM tblticketnotes WHERE ticketid = %s ORDER BY date ASC",
+            (ticket_id,),
+        )
+        for note_row in cur.fetchall():
+            posted_at = _safe_dt(note_row["date"])
+            if posted_at is None:
+                continue
+            TicketNote.objects.update_or_create(
+                ticket=ticket, whmcs_note_id=str(note_row["id"]),
+                defaults={
+                    "admin_name": note_row["admin"] or "",
+                    "message": note_row["message"] or "",
+                    "posted_at": posted_at,
+                },
+            )
+
+
+def _import_tickets(project, conn, dept_map, client_map):
     imported = 0
     with conn.cursor() as cur:
         cur.execute(
-            "SELECT id, tid, did, date, title, message, name, email, status, urgency, lastreply "
+            "SELECT id, tid, did, userid, date, title, message, name, email, status, urgency, lastreply "
             "FROM tbltickets"
         )
         rows = cur.fetchall()
@@ -216,12 +275,14 @@ def _import_tickets(project, conn, dept_map):
 
         last_reply_at = _safe_dt(row["lastreply"])
         department = dept_map.get(row["did"])
+        client = client_map.get(row["userid"])
 
         ticket, _ = TicketSnapshot.objects.update_or_create(
             project=project, whmcs_ticket_id=row["id"],
             defaults={
-                "tid": row["tid"] or "",
+                "tid": format_tid(row["tid"], row["id"], synthesize=project.use_synthetic_tid),
                 "department": department,
+                "client": client,
                 "subject": row["title"] or "",
                 "status": row["status"] or "",
                 "priority": row["urgency"] or "",
@@ -233,7 +294,9 @@ def _import_tickets(project, conn, dept_map):
             },
         )
 
-        if ticket.status == "Closed" and ticket.closed_at is None:
+        if ticket.status == "Closed" and TicketSnapshot.should_bump_closed_at(
+            ticket.closed_at, last_reply_at
+        ):
             ticket.closed_at = last_reply_at or timezone.now()
             ticket.save(update_fields=["closed_at"])
 
@@ -241,6 +304,7 @@ def _import_tickets(project, conn, dept_map):
         if first_response_at is not None and ticket.first_response_at != first_response_at:
             ticket.first_response_at = first_response_at
             ticket.save(update_fields=["first_response_at"])
+        _import_notes_for_ticket(ticket, conn, row["id"])
 
         apply_sla_evaluation(ticket)
         imported += 1
@@ -270,7 +334,8 @@ def process_dump_upload(upload_id):
         conn = _staging_connection(db_name)
         try:
             dept_map = _import_departments(upload.project, conn)
-            imported = _import_tickets(upload.project, conn, dept_map)
+            client_map = _import_clients(upload.project, conn)
+            imported = _import_tickets(upload.project, conn, dept_map, client_map)
         finally:
             conn.close()
 

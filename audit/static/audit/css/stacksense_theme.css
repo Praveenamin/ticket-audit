@@ -1,0 +1,194 @@
+/* Re-themes the stock Jazzmin/AdminLTE admin to match StackSense's design
+   tokens (Inter/JetBrains Mono fonts, sky-blue primary, slate-900 dark
+   sidebar, Tailwind-scale semantic colors) -- overrides Bootstrap 5's CSS
+   variables so the existing admin markup picks these up without any
+   template changes. */
+
+@import url('https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700&family=JetBrains+Mono:wght@400;500&display=swap');
+
+:root,
+[data-bs-theme="dark"] {
+    --bs-font-sans-serif: 'Inter', -apple-system, BlinkMacSystemFont, sans-serif;
+    --bs-font-monospace: 'JetBrains Mono', SFMono-Regular, Menlo, monospace;
+    --bs-body-font-family: var(--bs-font-sans-serif);
+
+    --bs-primary: #0ea5e9;
+    --bs-primary-rgb: 14, 165, 233;
+    --bs-success: #22c55e;
+    --bs-success-rgb: 34, 197, 94;
+    --bs-warning: #f59e0b;
+    --bs-warning-rgb: 245, 158, 11;
+    --bs-danger: #ef4444;
+    --bs-danger-rgb: 239, 68, 68;
+    --bs-info: #3b82f6;
+    --bs-info-rgb: 59, 130, 246;
+    --bs-secondary: #64748b;
+    --bs-secondary-rgb: 100, 116, 139;
+
+    --bs-link-color: var(--bs-primary);
+    --bs-link-color-rgb: var(--bs-primary-rgb);
+    --bs-link-hover-color: var(--bs-primary);
+}
+
+html, body, button, input, select, textarea {
+    font-family: var(--bs-font-sans-serif);
+}
+
+code, pre, .text-monospace {
+    font-family: var(--bs-font-monospace);
+}
+
+/* Select2 (every FK dropdown in this admin -- project/department/client
+   pickers, list filters) hardcodes font-family: sans-serif on its search
+   input. A class selector beats the plain "input" tag selector above on
+   specificity regardless of stylesheet order, so it was the one place that
+   never picked up Inter -- confirmed against select2.min.css directly. */
+.select2-container,
+.select2-search__field,
+.select2-results__option,
+.select2-selection__rendered {
+    font-family: var(--bs-font-sans-serif) !important;
+}
+
+/* AdminLTE's sidebar-dark-* / navbar-dark classes derive from the Bootstrap
+   contextual colors above; this pins the sidebar to StackSense's exact
+   slate-900 rather than AdminLTE's default near-black. */
+.app-sidebar,
+.sidebar-dark-primary {
+    background-color: #0f172a !important;
+}
+
+/* The username now shows in the top-right navbar instead (navbar_user.js) --
+   hide the sidebar's duplicate rather than showing it in both places. */
+.app-sidebar .user-panel {
+    display: none !important;
+}
+
+.navbar-username {
+    margin-left: 0.4rem;
+    font-weight: 500;
+}
+
+.text-success { color: var(--bs-success) !important; }
+.text-danger { color: var(--bs-danger) !important; }
+.text-warning { color: var(--bs-warning) !important; }
+.text-primary { color: var(--bs-primary) !important; }
+
+.btn-primary {
+    background-color: var(--bs-primary);
+    border-color: var(--bs-primary);
+}
+
+/* Shared styling for every in-app modal (.app-modal on the .modal element) --
+   explicit colors rather than relying on Bootstrap's --bs-modal-* variables,
+   which resolve to a near-black card on a near-black backdrop under
+   Jazzmin's dark theme -- reads as "the whole page went dark" instead of a
+   floating card over the dimmed, still-visible app (the look this is
+   deliberately matching). */
+.app-modal .modal-content {
+    background-color: #1e293b !important; /* slate-800 */
+    color: #e2e8f0 !important; /* slate-200 */
+    border: 1px solid rgba(255, 255, 255, 0.08);
+    border-radius: 1rem;
+    box-shadow: 0 25px 50px -12px rgba(0, 0, 0, 0.6);
+}
+
+.app-modal .modal-dialog {
+    max-width: 560px;
+}
+
+.app-modal .modal-header,
+.app-modal .modal-footer {
+    border-color: rgba(255, 255, 255, 0.08);
+    padding: 1rem 1.5rem;
+}
+
+.app-modal .modal-title {
+    font-weight: 600;
+}
+
+.app-modal .modal-body {
+    max-height: 60vh;
+    overflow-y: auto;
+    padding: 1.5rem;
+}
+
+/* Bootstrap's .btn-close is a bare icon with no chrome -- the reference
+   look uses a soft circular hit target, not a floating X. */
+.app-modal .btn-close {
+    width: 2rem;
+    height: 2rem;
+    padding: 0;
+    background-color: rgba(255, 255, 255, 0.08);
+    background-size: 0.85rem;
+    border-radius: 50%;
+    opacity: 1;
+}
+
+.app-modal .btn-close:hover {
+    background-color: rgba(255, 255, 255, 0.16);
+}
+
+/* Blurred, translucent backdrop -- the app stays visible (dimmed) behind
+   the modal instead of being hidden behind near-solid black. !important
+   because Bootstrap's own rule (.modal-backdrop.show{opacity:var(--bs-
+   backdrop-opacity)}) has equal specificity, and vendor CSS load order
+   isn't reliably "us last" once Jazzmin's bootswatch swap is involved. */
+.modal-backdrop {
+    backdrop-filter: blur(3px) !important;
+}
+
+.modal-backdrop.show {
+    opacity: 0.45 !important;
+}
+
+.app-modal .modal-body p {
+    margin-bottom: 0.5rem;
+}
+
+/* Superseded by the global navbar search (JAZZMIN_SETTINGS["search_model"]),
+   next to the sidebar-toggle hamburger on every page. Jazzmin's
+   change_list.html inlines this search box directly (no separate include to
+   override), so hiding it here is simpler than copying that whole template
+   for one input -- the filters/result-count next to it are untouched and
+   still fully functional. */
+#searchbar {
+    display: none;
+}
+
+/* auto_submit_filters.js (every ModelAdmin with list_filter) submits the
+   filter form the instant a filter changes, making the manual "Search"
+   button redundant everywhere it appears -- hidden here rather than
+   overriding Jazzmin's shared search_form.html for one button. */
+#changelist-search button[type="submit"] {
+    display: none;
+}
+
+/* Reference-design touch (Stack Alert's monitoring tables): small-caps,
+   letter-spaced, muted column headers instead of Bootstrap's plain bold
+   default -- a single rule since Django's own changelist table (#result_list)
+   and every custom report table share the same .table class already. */
+.table thead th {
+    text-transform: uppercase;
+    font-size: 0.72rem;
+    font-weight: 600;
+    letter-spacing: 0.06em;
+    color: #64748b; /* slate-500, matches --bs-secondary above */
+    border-bottom-width: 1px;
+}
+
+/* Numeric/ID-like columns line up better with tabular figures -- most
+   visible in the Closed Tickets Summary report's Ticket Number column and
+   any list view sorted on a numeric field. */
+td, th {
+    font-variant-numeric: tabular-nums;
+}
+
+/* Tertiary bg is Bootstrap's own "page background behind cards" token
+   (already used by the body's bg-body-tertiary class) -- pinned to an exact
+   slate-50 rather than Bootstrap's stock off-white, closer to the reference
+   design's cool blue-gray backdrop. */
+:root,
+[data-bs-theme="dark"] {
+    --bs-tertiary-bg: #f8fafc;
+}

@@ -39,14 +39,25 @@ class WHMCSClient:
         }
         try:
             response = requests.post(self.endpoint, data=payload, timeout=self.timeout)
-            response.raise_for_status()
         except requests.exceptions.Timeout as exc:
             raise WHMCSAPIError(f"WHMCS API timeout calling {action}") from exc
         except requests.exceptions.RequestException as exc:
             raise WHMCSAPIError(f"WHMCS API error calling {action}: {exc}") from exc
+
+        # Some WHMCS installs answer an auth failure (e.g. "Invalid or missing
+        # credentials") with a non-2xx status *and* a well-formed JSON error
+        # body -- checking the body first, before raise_for_status(), means
+        # that message reaches the caller instead of being swallowed into a
+        # generic "403 Forbidden" with no explanation. Only fall back to the
+        # raw HTTP status when there's no JSON body to explain the failure at
+        # all (e.g. a firewall/CDN block returning an HTML page).
         try:
             return response.json()
         except ValueError as exc:
+            try:
+                response.raise_for_status()
+            except requests.exceptions.RequestException as http_exc:
+                raise WHMCSAPIError(f"WHMCS API error calling {action}: {http_exc}") from http_exc
             raise WHMCSAPIError(f"WHMCS API returned non-JSON response for {action}") from exc
 
     def get_tickets_page(self, limitstart=0, limitnum=25, **extra):

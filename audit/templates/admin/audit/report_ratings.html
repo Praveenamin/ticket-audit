@@ -1,0 +1,56 @@
+{% extends "admin/base_site.html" %}
+
+{% block content_title %}{{ title }}{% endblock %}
+
+{% block content %}
+<form method="get" class="d-flex flex-wrap gap-3 align-items-end mb-4">
+  <div>
+    <label class="form-label mb-1">Project</label>
+    <select name="project" class="form-select" onchange="this.form.submit()">
+      {% for project in projects %}
+        <option value="{{ project.id }}" {% if project.id == selected_project %}selected{% endif %}>{{ project.name }}</option>
+      {% endfor %}
+    </select>
+  </div>
+  <div>
+    <label class="form-label mb-1">Reply posted from</label>
+    <input type="date" name="date_from" class="form-control" value="{{ date_from }}">
+  </div>
+  <div>
+    <label class="form-label mb-1">Reply posted to</label>
+    <input type="date" name="date_to" class="form-control" value="{{ date_to }}">
+  </div>
+  <button type="submit" class="btn btn-primary">Run Report</button>
+</form>
+
+<p class="text-muted">
+  Filtered by when the rated reply was posted -- WHMCS doesn't record a separate date
+  the client actually submitted the star rating, so a reply rated well after it was
+  posted won't necessarily fall in the window you'd expect.
+</p>
+
+<table class="table table-striped">
+  <thead>
+    <tr>
+      <th>S.No</th>
+      <th>Ticket ID</th>
+      <th>Client Name</th>
+      <th>Star Rating</th>
+      <th>Tech</th>
+    </tr>
+  </thead>
+  <tbody>
+    {% for row in rows %}
+      <tr>
+        <td>{{ forloop.counter }}</td>
+        <td><a href="{% url 'admin:audit_ticketsnapshot_change' row.ticket.pk %}">{{ row.ticket.tid|default:row.ticket.whmcs_ticket_id }}</a></td>
+        <td>{{ row.client_label }}</td>
+        <td>{{ row.rating }} &#9733;</td>
+        <td>{{ row.tech }}</td>
+      </tr>
+    {% empty %}
+      <tr><td colspan="5">No rated replies in this window.</td></tr>
+    {% endfor %}
+  </tbody>
+</table>
+{% endblock %}

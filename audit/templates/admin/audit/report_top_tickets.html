@@ -1,0 +1,49 @@
+{% extends "admin/base_site.html" %}
+
+{% block content_title %}{{ title }}{% endblock %}
+
+{% block content %}
+<form method="get" class="d-flex flex-wrap gap-3 align-items-end mb-4">
+  <div>
+    <label class="form-label mb-1">Project</label>
+    <select name="project" class="form-select" onchange="this.form.submit()">
+      {% for project in projects %}
+        <option value="{{ project.id }}" {% if project.id == selected_project %}selected{% endif %}>{{ project.name }}</option>
+      {% endfor %}
+    </select>
+  </div>
+  <div>
+    <label class="form-label mb-1">Window</label>
+    <select name="window" class="form-select" onchange="this.form.submit()">
+      <option value="week" {% if window == "week" %}selected{% endif %}>Last 7 days</option>
+      <option value="month" {% if window == "month" %}selected{% endif %}>Last 30 days</option>
+    </select>
+  </div>
+  <button type="submit" class="btn btn-primary">Update</button>
+</form>
+
+<table class="table table-striped">
+  <thead>
+    <tr>
+      <th>#</th>
+      <th>Ticket</th>
+      <th>Subject</th>
+      <th>Status</th>
+      <th>Replies</th>
+    </tr>
+  </thead>
+  <tbody>
+    {% for row in rows %}
+      <tr>
+        <td>{{ forloop.counter }}</td>
+        <td><a href="{% url 'admin:audit_ticketsnapshot_change' row.ticket.pk %}">{{ row.ticket.tid|default:row.ticket.whmcs_ticket_id }}</a></td>
+        <td>{{ row.ticket.subject }}</td>
+        <td>{{ row.ticket.status }}</td>
+        <td>{{ row.reply_count }}</td>
+      </tr>
+    {% empty %}
+      <tr><td colspan="5">No ticket activity in this window.</td></tr>
+    {% endfor %}
+  </tbody>
+</table>
+{% endblock %}

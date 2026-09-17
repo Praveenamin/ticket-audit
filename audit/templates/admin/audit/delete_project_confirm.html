@@ -1,0 +1,39 @@
+{% extends "admin/base_site.html" %}
+{% load static %}
+
+{% block content_title %}{{ title }}{% endblock %}
+
+{% block content %}
+  <div class="alert alert-danger">
+    <strong>This is permanent.</strong> There is no undo, no recycle bin, and no backup taken by this action.
+  </div>
+  <p>
+    This deletes <strong>only this app's own local database records</strong> for
+    <strong>{{ project.name }}</strong>. It never calls the WHMCS API and cannot reach
+    WHMCS's own production system or database in any way -- there is no code path in
+    this app that writes to WHMCS at all.
+  </p>
+
+  <table class="table table-sm" style="max-width: 480px;">
+    <tbody>
+      {% for label, count in counts.items %}
+        <tr><td>{{ label }}</td><td class="text-end">{{ count }}</td></tr>
+      {% endfor %}
+      <tr class="fw-bold"><td>Total</td><td class="text-end">{{ total }}</td></tr>
+    </tbody>
+  </table>
+
+  <form method="post" style="max-width: 480px;">
+    {% csrf_token %}
+    <div class="mb-3">
+      <label class="form-label" for="id_confirm_name">Type <strong>{{ project.name }}</strong> exactly to confirm:</label>
+      <input type="text" name="confirm_name" id="id_confirm_name" class="form-control"
+             data-expected-name="{{ project.name }}" autocomplete="off">
+    </div>
+    <button type="submit" id="delete-everything-submit" class="btn btn-danger" disabled>
+      Delete {{ total }} row(s) permanently
+    </button>
+    <a href="{{ changelist_url }}" class="btn btn-secondary">Cancel</a>
+  </form>
+  <script src="{% static 'audit/js/delete_project_confirm.js' %}"></script>
+{% endblock %}

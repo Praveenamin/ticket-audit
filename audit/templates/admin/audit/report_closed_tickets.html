@@ -1,0 +1,92 @@
+{% extends "admin/base_site.html" %}
+
+{% block content_title %}{{ title }}{% endblock %}
+
+{% block content %}
+<form method="get" class="d-flex flex-wrap gap-3 align-items-end mb-4">
+  <div>
+    <label class="form-label mb-1">Project</label>
+    <select name="project" class="form-select" onchange="this.form.submit()">
+      {% for project in projects %}
+        <option value="{{ project.id }}" {% if project.id == selected_project %}selected{% endif %}>{{ project.name }}</option>
+      {% endfor %}
+    </select>
+  </div>
+  <div>
+    <label class="form-label mb-1">Closed from</label>
+    <input type="date" name="date_from" class="form-control" value="{{ date_from }}">
+  </div>
+  <div>
+    <label class="form-label mb-1">Closed to</label>
+    <input type="date" name="date_to" class="form-control" value="{{ date_to }}">
+  </div>
+  <div>
+    <label class="form-label mb-1">Status</label>
+    <select name="status" class="form-select" onchange="this.form.submit()">
+      <option value="" {% if not status_filter %}selected{% endif %}>All</option>
+      <option value="not_queued" {% if status_filter == "not_queued" %}selected{% endif %}>Not queued</option>
+      <option value="queued" {% if status_filter == "queued" %}selected{% endif %}>Queued</option>
+      <option value="processing" {% if status_filter == "processing" %}selected{% endif %}>Processing</option>
+      <option value="completed" {% if status_filter == "completed" %}selected{% endif %}>Completed</option>
+    </select>
+  </div>
+  <div>
+    <label class="form-label mb-1">Show</label>
+    <select name="page_size" class="form-select" onchange="this.form.submit()">
+      {% for choice in page_size_choices %}
+        <option value="{{ choice }}" {% if choice == page_size %}selected{% endif %}>
+          {% if choice == "all" %}All{% else %}{{ choice }}{% endif %}
+        </option>
+      {% endfor %}
+    </select>
+  </div>
+  <button type="submit" class="btn btn-primary">Run Report</button>
+  {% if selected_project %}
+    <button type="submit" formaction="{% url 'admin:audit_report_closed_tickets_queue' %}"
+            class="btn btn-outline-primary">Queue for AI Summary</button>
+    <button type="submit" formaction="{% url 'admin:audit_report_closed_tickets_export' %}"
+            class="btn btn-outline-secondary">Export CSV</button>
+  {% endif %}
+</form>
+
+{% if selected_project %}
+  <p class="text-muted">Showing {{ shown_count }} of {{ total_count }} ticket(s).</p>
+{% endif %}
+
+<table class="table table-striped">
+  <thead>
+    <tr>
+      <th>S.No</th>
+      <th>Client Name</th>
+      <th>Ticket Number</th>
+      <th>Opened</th>
+      <th>Closed</th>
+      <th>Short Description</th>
+      <th>Problem Source</th>
+      <th>Problem Type</th>
+      <th>Problem Root Cause</th>
+      <th>Fixed on</th>
+      <th>Status</th>
+    </tr>
+  </thead>
+  <tbody>
+    {% for row in rows %}
+      <tr>
+        <td>{{ forloop.counter }}</td>
+        <td>{{ row.client_label }}</td>
+        <td><a href="{% url 'admin:audit_ticketsnapshot_change' row.ticket.pk %}">{{ row.ticket.tid|default:row.ticket.whmcs_ticket_id }}</a></td>
+        <td>{{ row.ticket.opened_at|date:"Y-m-d" }}</td>
+        <td>{{ row.ticket.closed_at|date:"Y-m-d" }}</td>
+        <td>{{ row.ticket.subject }}</td>
+        <td>{{ row.summary.problem_source|default:"-" }}</td>
+        <td>{{ row.summary.get_problem_type_display|default:"-" }}</td>
+        <td>{{ row.summary.problem_root_cause|default:"-" }}</td>
+        <td>{{ row.summary.fixed_on|default:"-" }}</td>
+        <td>{{ row.status_badge }}</td>
+      </tr>
+    {% empty %}
+      <tr><td colspan="11">No closed tickets in this window.</td></tr>
+    {% endfor %}
+  </tbody>
+</table>
+{% endblock %}

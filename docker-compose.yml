@@ -56,6 +56,27 @@ services:
       timeout: 5s
       retries: 10
 
+  ollama:
+    image: ollama/ollama:latest
+    container_name: whmcsaudit_ollama
+    volumes:
+      - whmcsaudit_ollama_data:/root/.ollama
+    # Internal only -- no host port published, same pattern as staging_db.
+    # Dedicated to this app, not shared with the sibling StackSense project's
+    # own Ollama container (confirmed: that one has no models pulled either,
+    # and sits on a separate Docker network -- nothing gained by sharing).
+    # One-time step after first `docker compose up -d`:
+    #   docker compose exec ollama ollama pull llama3.2:latest
+    networks:
+      - whmcsaudit_network
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD-SHELL", "ollama list || exit 1"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 30s
+
   web:
     build:
       context: .
@@ -117,6 +138,8 @@ services:
         condition: service_healthy
       staging_db:
         condition: service_healthy
+      ollama:
+        condition: service_healthy
     restart: unless-stopped
 
 volumes:
@@ -124,6 +147,7 @@ volumes:
   whmcsaudit_redis_data:
   whmcsaudit_static:
   whmcsaudit_media:
+  whmcsaudit_ollama_data:
   whmcsaudit_staging_data:
 
 networks:

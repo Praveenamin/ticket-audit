@@ -12,7 +12,9 @@ from datetime import datetime, timedelta, timezone as dt_timezone
 from django.utils import timezone
 
 from .models import Department, TicketReply, TicketSnapshot
+from .s3_archive import archive_reply
 from .sla import apply_sla_evaluation
+from .tid_format import format_tid
 from .whmcs_client import WHMCSClient
 
 logger = logging.getLogger("audit")
@@ -40,29 +42,46 @@ def _upsert_department(project, deptid, deptname):
     return department
 
 
-def _upsert_replies(ticket, replies_payload):
+def _upsert_replies(project, ticket, replies_payload):
     replies = (replies_payload or {}).get("reply", [])
     if isinstance(replies, dict):
         replies = [replies]
 
+    should_archive = project.s3_archive_enabled and ticket.s3_archive_eligible
+    tid_display = ticket.tid or ticket.whmcs_ticket_id
+
     first_response_at = None
     for reply in replies:
         posted_at = _parse_whmcs_dt(reply.get("date"))
-        author_type = reply.get("requestor_type", "")
-        TicketReply.objects.update_or_create(
+        # `or ""`, not `.get(key, "")` -- see the identical fix/comment on
+        # _sync_one_ticket's ticket fields: WHMCS can return an explicit
+        # JSON null here too, which .get()'s default wouldn't catch.
+        author_type = reply.get("requestor_type") or ""
+        reply_obj, _created = TicketReply.objects.update_or_create(
             ticket=ticket,
             whmcs_reply_id=str(reply.get("replyid")),
             defaults={
-                "author_name": reply.get("name", ""),
+                "author_name": reply.get("name") or "",
                 "author_type": author_type,
-                "admin_name": reply.get("admin", ""),
-                "message": reply.get("message", ""),
+                "admin_name": reply.get("admin") or "",
+                "message": reply.get("message") or "",
+                "rating": reply.get("rating") or 0,
                 "posted_at": posted_at,
             },
         )
         if author_type == TicketReply.OPERATOR and posted_at is not None:
             if first_response_at is None or posted_at < first_response_at:
                 first_response_at = posted_at
+
+        if should_archive and reply_obj.archived_to_s3_at is None:
+            try:
+                archive_reply(reply_obj, project, tid_display)
+            except Exception:
+                # archive_reply already catches boto3's own expected failures and
+                # returns False -- this is only a backstop against a genuinely
+                # unexpected bug, so one reply's failure can never also skip
+                # apply_sla_evaluation for the rest of this ticket.
+                logger.exception("Unexpected error archiving reply %s to S3", reply_obj.id)
     return first_response_at
 
 
@@ -80,27 +99,46 @@ def _sync_one_ticket(project, client, summary):
     ticket, _ = TicketSnapshot.objects.update_or_create(
         project=project, whmcs_ticket_id=whmcs_ticket_id,
         defaults={
-            "tid": summary.get("tid", ""),
+            "tid": format_tid(summary.get("tid", ""), whmcs_ticket_id, synthesize=project.use_synthetic_tid),
             "department": department,
-            "subject": summary.get("subject", ""),
-            "status": summary.get("status", ""),
-            "priority": summary.get("priority", ""),
-            "requestor_name": summary.get("requestor_name", ""),
-            "requestor_email": summary.get("requestor_email", ""),
+            # .get(key, "") only falls back to "" when the key is *absent* --
+            # WHMCS returns some of these as an explicit JSON null on older
+            # tickets (confirmed: requestor_name), which .get() passes
+            # through as None and violates these columns' NOT NULL
+            # constraint. `or ""` catches None too, not just a missing key.
+            "subject": summary.get("subject") or "",
+            "status": summary.get("status") or "",
+            "priority": summary.get("priority") or "",
+            "requestor_name": summary.get("requestor_name") or "",
+            "requestor_email": summary.get("requestor_email") or "",
             "opened_at": _parse_whmcs_dt(summary.get("date")),
             "last_reply_at": last_reply_at,
             "synced_at": timezone.now(),
         },
     )
 
-    if ticket.status == "Closed" and ticket.closed_at is None:
+    if ticket.status == "Closed" and TicketSnapshot.should_bump_closed_at(
+        ticket.closed_at, last_reply_at
+    ):
         ticket.closed_at = last_reply_at or timezone.now()
         ticket.save(update_fields=["closed_at"])
+
+    # Decided once, the first time this ticket is ever synced -- never added to
+    # update_or_create's defaults above, so a later sync can't structurally flip it
+    # back to False. Known, accepted boundary case: a ticket opened at 23:58 IST
+    # whose first sync lands at 00:02 IST the next day is judged by *discovery*
+    # date, not literal open time -- an inherent edge of any calendar-day
+    # definition, not worth engineering around.
+    if existing is None and project.s3_archive_enabled:
+        opened_local_date = timezone.localtime(ticket.opened_at).date() if ticket.opened_at else None
+        if opened_local_date == timezone.localdate():
+            ticket.s3_archive_eligible = True
+            ticket.save(update_fields=["s3_archive_eligible"])
 
     if needs_full_refresh:
         detail = client.get_ticket(whmcs_ticket_id)
         if detail.get("result") == "success":
-            first_response_at = _upsert_replies(ticket, detail.get("replies"))
+            first_response_at = _upsert_replies(project, ticket, detail.get("replies"))
             if first_response_at is not None and ticket.first_response_at != first_response_at:
                 ticket.first_response_at = first_response_at
                 ticket.save(update_fields=["first_response_at"])
@@ -111,6 +149,26 @@ def _sync_one_ticket(project, client, summary):
 
     apply_sla_evaluation(ticket)
     return ticket
+
+
+def refresh_ticket_replies(project, ticket):
+    """Re-fetch GetTicket and re-upsert this ticket's replies right now, regardless of
+    whether last_reply_at changed -- unlike _sync_one_ticket's needs_full_refresh gate.
+    Used by the one-time ratings backfill (backfill_reply_ratings) to pick up the new
+    `rating` field on tickets already synced before it existed. Returns True on a
+    successful GetTicket call. Deliberately does not touch first_response_at/
+    apply_sla_evaluation -- backfilling ratings on an unchanged reply set has no reason
+    to perturb SLA state; keep the blast radius to exactly the new field."""
+    client = WHMCSClient(
+        base_url=project.whmcs_base_url, identifier=project.whmcs_api_identifier,
+        secret=project.whmcs_api_secret,
+    )
+    detail = client.get_ticket(ticket.whmcs_ticket_id)
+    if detail.get("result") != "success":
+        logger.warning("GetTicket failed for #%s: %s", ticket.whmcs_ticket_id, detail.get("message"))
+        return False
+    _upsert_replies(project, ticket, detail.get("replies"))
+    return True
 
 
 def sync_tickets(project):
