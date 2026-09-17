@@ -220,6 +220,7 @@ JAZZMIN_SETTINGS = {
         "audit.department": "fas fa-sitemap",
         "audit.closedticketsummary": "fas fa-robot",
         "audit.ticketaudit": "fas fa-magnifying-glass-chart",
+        "audit.ticketescalationanalysis": "fas fa-triangle-exclamation",
     },
     # "Reports" doesn't match any installed app label, so Jazzmin renders it
     # as its own sidebar group rather than appending to an existing one.

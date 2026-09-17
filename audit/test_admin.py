@@ -8,6 +8,7 @@ tests so a later admin.py change can't silently reopen them.
 from datetime import timedelta
 from unittest.mock import patch
 
+from django.contrib import admin as django_admin
 from django.contrib.auth import get_user_model
 from django.core.files.storage import default_storage
 from django.core.files.uploadedfile import SimpleUploadedFile
@@ -15,10 +16,11 @@ from django.test import Client, TestCase
 from django.urls import reverse
 from django.utils import timezone
 
-from .admin import TicketSnapshotAdmin
+from .admin import TicketEscalationAnalysisAdmin, TicketSnapshotAdmin
 from .models import (
     Client as ClientModel, ClosedTicketSummary, Department, DumpUpload, Project,
-    ProjectDeletionLog, SLAPolicy, TicketAudit, TicketNote, TicketReply, TicketSnapshot,
+    ProjectDeletionLog, SLAPolicy, TicketAudit, TicketEscalationAnalysis, TicketNote,
+    TicketReply, TicketSnapshot,
 )
 from .whmcs_client import WHMCSAPIError
 
@@ -891,3 +893,100 @@ class ProjectDeleteEverythingViewTests(TestCase):
         )
         for forbidden in ("WHMCSClient", "whmcs_client", "pymysql", "staging_db", "dump_import"):
             self.assertNotIn(forbidden, names)
+
+
+class EscalationRiskBadgeTests(TestCase):
+    """TicketSnapshotAdmin.escalation_risk_badge -- color/emoji/score per sentiment
+    category, and the fallback text when there's nothing to show yet. Called
+    directly on a real ModelAdmin instance rather than through an HTTP request --
+    matches _pending_sla_label's own direct-call test style, no rendering pipeline
+    needed to check this one method's output."""
+
+    def setUp(self):
+        self.admin = TicketSnapshotAdmin(TicketSnapshot, django_admin.site)
+        self.project = Project.objects.create(name="P1", source_type=Project.SOURCE_API)
+        self.ticket = TicketSnapshot.objects.create(
+            project=self.project, whmcs_ticket_id=1, tid="T-1", status="Open", opened_at=timezone.now(),
+        )
+
+    def test_no_analysis_yet_shows_muted_fallback(self):
+        html = self.admin.escalation_risk_badge(self.ticket)
+        self.assertIn("Not yet analyzed", html)
+
+    def test_queued_status_shows_status_not_a_score(self):
+        TicketEscalationAnalysis.objects.create(ticket=self.ticket, status=TicketEscalationAnalysis.STATUS_QUEUED)
+        html = self.admin.escalation_risk_badge(self.ticket)
+        self.assertIn("Queued", html)
+
+    def test_critical_renders_red_with_score(self):
+        TicketEscalationAnalysis.objects.create(
+            ticket=self.ticket, status=TicketEscalationAnalysis.STATUS_DONE,
+            sentiment_category=TicketEscalationAnalysis.SENTIMENT_CRITICAL, escalation_risk_score=92,
+        )
+        html = self.admin.escalation_risk_badge(self.ticket)
+        self.assertIn("text-danger", html)
+        self.assertIn("🔴", html)
+        self.assertIn("92%", html)
+
+    def test_frustrated_renders_yellow_with_score(self):
+        TicketEscalationAnalysis.objects.create(
+            ticket=self.ticket, status=TicketEscalationAnalysis.STATUS_DONE,
+            sentiment_category=TicketEscalationAnalysis.SENTIMENT_FRUSTRATED, escalation_risk_score=55,
+        )
+        html = self.admin.escalation_risk_badge(self.ticket)
+        self.assertIn("text-warning", html)
+        self.assertIn("🟡", html)
+        self.assertIn("55%", html)
+
+    def test_healthy_renders_green_with_score(self):
+        TicketEscalationAnalysis.objects.create(
+            ticket=self.ticket, status=TicketEscalationAnalysis.STATUS_DONE,
+            sentiment_category=TicketEscalationAnalysis.SENTIMENT_HEALTHY, escalation_risk_score=5,
+        )
+        html = self.admin.escalation_risk_badge(self.ticket)
+        self.assertIn("text-success", html)
+        self.assertIn("🟢", html)
+        self.assertIn("5%", html)
+
+    def test_column_is_sortable_by_risk_score(self):
+        # @admin.display(ordering=...) stamps admin_order_field on the function --
+        # this IS what makes the column header a clickable sort link in the real
+        # changelist, so checking it directly proves the column is genuinely
+        # sortable without needing a full HTTP changelist round-trip.
+        self.assertEqual(
+            TicketSnapshotAdmin.escalation_risk_badge.admin_order_field,
+            "escalation_analysis__escalation_risk_score",
+        )
+
+    def test_list_filter_includes_sentiment_category(self):
+        self.assertIn("escalation_analysis__sentiment_category", TicketSnapshotAdmin.list_filter)
+
+
+class TicketEscalationAnalysisAdminTests(TestCase):
+    """Standalone, read-only, project-wide escalation-analysis list -- mirrors
+    TicketAuditAdmin: creation only ever happens via sync.py's hook, never here."""
+
+    def setUp(self):
+        self.client = admin_client()
+        self.project = Project.objects.create(name="P1", source_type=Project.SOURCE_API)
+        self.ticket = TicketSnapshot.objects.create(
+            project=self.project, whmcs_ticket_id=1, tid="T-1", status="Open", opened_at=timezone.now(),
+        )
+        self.analysis = TicketEscalationAnalysis.objects.create(
+            ticket=self.ticket, status=TicketEscalationAnalysis.STATUS_DONE,
+            sentiment_category=TicketEscalationAnalysis.SENTIMENT_CRITICAL, escalation_risk_score=90,
+        )
+
+    def test_add_permission_denied(self):
+        admin_instance = TicketEscalationAnalysisAdmin(TicketEscalationAnalysis, django_admin.site)
+        self.assertFalse(admin_instance.has_add_permission(None))
+
+    def test_change_permission_denied(self):
+        admin_instance = TicketEscalationAnalysisAdmin(TicketEscalationAnalysis, django_admin.site)
+        self.assertFalse(admin_instance.has_change_permission(None))
+
+    def test_changelist_shows_the_row(self):
+        response = self.client.get(reverse("admin:audit_ticketescalationanalysis_changelist"))
+        self.assertEqual(response.status_code, 200)
+        self.assertContains(response, "T-1")
+        self.assertContains(response, "90")

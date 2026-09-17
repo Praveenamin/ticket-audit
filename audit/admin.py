@@ -19,7 +19,7 @@ from django.utils.text import capfirst
 from . import reports
 from .models import (
     Client, ClosedTicketSummary, Department, DumpUpload, Project, ProjectDeletionLog,
-    SLAPolicy, TicketAudit, TicketNote, TicketReply, TicketSnapshot,
+    SLAPolicy, TicketAudit, TicketEscalationAnalysis, TicketNote, TicketReply, TicketSnapshot,
 )
 from .closed_ticket_summary import average_processing_seconds, queue_closed_tickets_for_range
 from .sla import breach_summary, explain_sla
@@ -187,8 +187,10 @@ class ProjectAdmin(admin.ModelAdmin):
     JS toggles them out of the form for "dump" projects (default and initial
     state on Add) since they'd otherwise be a confusing, unused prompt."""
 
-    list_display = ("name", "source_type", "active", "s3_archive_enabled", "created_at")
-    list_filter = ("source_type", "active", "s3_archive_enabled")
+    list_display = (
+        "name", "source_type", "active", "s3_archive_enabled", "escalation_analysis_enabled", "created_at",
+    )
+    list_filter = ("source_type", "active", "s3_archive_enabled", "escalation_analysis_enabled")
     inlines = [DumpUploadInline]
 
     def has_delete_permission(self, request, obj=None):
@@ -568,7 +570,7 @@ class TicketAuditInline(admin.TabularInline):
 class TicketSnapshotAdmin(ReadOnlyAdminMixin, admin.ModelAdmin):
     list_display = (
         "tid_display", "opened_at_display", "last_reply_at_display", "project", "department_display", "status",
-        "operator_display", "sla_status_badge", "breach_detail",
+        "operator_display", "sla_status_badge", "escalation_risk_badge", "breach_detail",
     )
     # None, not () -- Django's ModelAdmin default for list_display_links IS ()
     # already, and items_for_result() treats "falsy but not None" as "auto-link
@@ -579,17 +581,22 @@ class TicketSnapshotAdmin(ReadOnlyAdminMixin, admin.ModelAdmin):
     list_display_links = None  # tid_display supplies its own click target (a modal, not the change page)
     list_filter = (
         TicketOpenedDateFilter, "project", ProjectScopedDepartmentFilter, "sla_status", "priority", "status",
+        "escalation_analysis__sentiment_category",
     )
     search_fields = ("tid", "subject", "requestor_name", "requestor_email")
     readonly_fields = (
-        "breach_explanation", "ai_audit_display", "closed_ticket_summary_display", "details_display",
+        "breach_explanation", "ai_audit_display", "closed_ticket_summary_display", "escalation_analysis_display",
+        "details_display",
     )
     # Plain fields (not fieldsets) -- Jazzmin's horizontal_tabs template maps
     # every named fieldset to its OWN tab (confirmed against its own
     # horizontal_tabs.html), so a second fieldset for "Details" would render
     # as a sibling tab next to "General", not a section within it.
     # details_display builds the collapsible section itself instead.
-    fields = ("breach_explanation", "ai_audit_display", "closed_ticket_summary_display", "details_display")
+    fields = (
+        "breach_explanation", "ai_audit_display", "closed_ticket_summary_display", "escalation_analysis_display",
+        "details_display",
+    )
     inlines = [TicketReplyInline, TicketNoteInline, TicketAuditInline]
 
     class Media:
@@ -601,15 +608,16 @@ class TicketSnapshotAdmin(ReadOnlyAdminMixin, admin.ModelAdmin):
     def get_queryset(self, request):
         # breach_detail()/operator_display()/tid_display()/ai_audit_display()
         # need ticket_replies/ai_audits -- prefetch once per page instead of
-        # one query per row. select_related("closed_summary") for
-        # closed_ticket_summary_display -- it's a OneToOne, so this is a
-        # single JOIN, not a second query. select_related("project",
+        # one query per row. select_related("closed_summary")/
+        # select_related("escalation_analysis") for closed_ticket_summary_display/
+        # escalation_risk_badge/escalation_analysis_display -- both OneToOne, so
+        # each is a single JOIN, not a second query. select_related("project",
         # "department") for the list_display columns of the same names --
         # each was otherwise a fresh query per row (N+1), pre-existing before
         # department_display but worth fixing now that this method is
         # touched anyway.
         return super().get_queryset(request).select_related(
-            "closed_summary", "project", "department",
+            "closed_summary", "escalation_analysis", "project", "department",
         ).prefetch_related("ticket_replies", "ticket_notes", "ai_audits")
 
     @admin.display(description="Ticket ID", ordering="tid")
@@ -695,6 +703,51 @@ class TicketSnapshotAdmin(ReadOnlyAdminMixin, admin.ModelAdmin):
         if obj.sla_policy_id is None:
             return "No policy"
         return "Pending"
+
+    @admin.display(description="Escalation risk", ordering="escalation_analysis__escalation_risk_score")
+    def escalation_risk_badge(self, obj):
+        # getattr(..., None), not obj.escalation_analysis: a OneToOneField reverse
+        # accessor raises RelatedObjectDoesNotExist (not just returns None) when no
+        # row exists yet -- see the identical caveat on closed_ticket_summary_display.
+        analysis = getattr(obj, "escalation_analysis", None)
+        url = reverse("admin:audit_ticketsnapshot_change", args=[obj.pk])
+        if analysis is None or analysis.status != TicketEscalationAnalysis.STATUS_DONE:
+            label = "Not yet analyzed" if analysis is None else analysis.get_status_display()
+            return format_html('<a href="{}" class="text-muted">{}</a>', url, label)
+        emoji = {
+            TicketEscalationAnalysis.SENTIMENT_CRITICAL: "🔴",
+            TicketEscalationAnalysis.SENTIMENT_FRUSTRATED: "🟡",
+            TicketEscalationAnalysis.SENTIMENT_HEALTHY: "🟢",
+        }[analysis.sentiment_category]
+        css_class = {
+            TicketEscalationAnalysis.SENTIMENT_CRITICAL: "text-danger",
+            TicketEscalationAnalysis.SENTIMENT_FRUSTRATED: "text-warning",
+            TicketEscalationAnalysis.SENTIMENT_HEALTHY: "text-success",
+        }[analysis.sentiment_category]
+        return format_html(
+            '<a href="{}"><strong class="{}">{} {}%</strong></a>',
+            url, css_class, emoji, analysis.escalation_risk_score,
+        )
+
+    @admin.display(description="Escalation analysis")
+    def escalation_analysis_display(self, obj):
+        analysis = getattr(obj, "escalation_analysis", None)
+        if analysis is None:
+            return format_html("<p>Not yet analyzed -- this project may not have escalation analysis enabled.</p>")
+        if analysis.status != TicketEscalationAnalysis.STATUS_DONE:
+            detail = analysis.error_message or "in progress"
+            return format_html("<p>Escalation analysis {}: {}</p>", analysis.get_status_display().lower(), detail)
+        return format_html(
+            "<p><strong>{}</strong> -- {}% escalation risk</p>"
+            "<p>Primary frustration driver: {}</p>"
+            "<p>{}</p>"
+            "<p class='text-muted'>Model: {} -- last analyzed {}</p>",
+            analysis.get_sentiment_category_display(), analysis.escalation_risk_score,
+            analysis.get_frustration_driver_display() if analysis.frustration_driver else "(none)",
+            analysis.justification,
+            analysis.model_used or "(unknown)",
+            timezone.localtime(analysis.finished_at).strftime("%Y-%m-%d %H:%M") if analysis.finished_at else "-",
+        )
 
     # Every raw record field down through sla_status -- deliberately NOT a
     # second fieldset (see the "fields" comment above for why that renders
@@ -1164,6 +1217,45 @@ class TicketAuditAdmin(admin.ModelAdmin):
     def ticket_display(self, obj):
         url = reverse("admin:audit_ticketaudit_change", args=[obj.pk])
         return format_html("<a href=\"{}\">#{}</a>", url, obj.ticket.tid or obj.ticket.whmcs_ticket_id)
+
+
+@admin.register(TicketEscalationAnalysis)
+class TicketEscalationAnalysisAdmin(admin.ModelAdmin):
+    """Every escalation analysis across every ticket, project-wide, filterable by
+    sentiment/project and sortable by risk score -- "show me every Critical ticket
+    across the whole account," not just one at a time (TicketSnapshotAdmin's own
+    escalation_risk_badge column covers the per-ticket-list view). Read-only,
+    mirrors TicketAuditAdmin exactly: creation only ever happens via sync.py's hook,
+    never here."""
+
+    list_display = (
+        "ticket_display", "project_display", "sentiment_category", "escalation_risk_score",
+        "frustration_driver", "status", "finished_at",
+    )
+    list_filter = ("sentiment_category", "frustration_driver", "status", "ticket__project")
+    ordering = ("-escalation_risk_score",)
+    list_display_links = None
+
+    class Media:
+        js = ("audit/js/auto_submit_filters.js",)
+
+    def get_queryset(self, request):
+        return super().get_queryset(request).select_related("ticket", "ticket__project")
+
+    def has_add_permission(self, request):
+        return False
+
+    def has_change_permission(self, request, obj=None):
+        return False
+
+    @admin.display(description="Ticket", ordering="ticket")
+    def ticket_display(self, obj):
+        url = reverse("admin:audit_ticketescalationanalysis_change", args=[obj.pk])
+        return format_html("<a href=\"{}\">#{}</a>", url, obj.ticket.tid or obj.ticket.whmcs_ticket_id)
+
+    @admin.display(description="Project", ordering="ticket__project__name")
+    def project_display(self, obj):
+        return obj.ticket.project.name
 
 
 @admin.register(ClosedTicketSummary)

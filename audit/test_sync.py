@@ -10,14 +10,14 @@ tickets. These pin the `or ""` fix down as a closed set: every affected
 field, individually, as an explicit None -- not just a happy-path smoke test.
 """
 
-from datetime import timedelta
+from datetime import timedelta, timezone as dt_timezone
 from unittest.mock import Mock, patch
 
 from django.test import TestCase
 from django.utils import timezone
 
-from .models import Project, TicketReply, TicketSnapshot
-from .sync import _sync_one_ticket, _upsert_replies, refresh_ticket_replies
+from .models import Project, TicketEscalationAnalysis, TicketReply, TicketSnapshot
+from .sync import _sync_one_ticket, _upsert_replies, refresh_ticket_replies, sync_tickets
 
 
 def make_project(name="Test Project", **overrides):
@@ -303,3 +303,131 @@ class RefreshTicketRepliesTests(TestCase):
         result = refresh_ticket_replies(self.project, self.ticket)
 
         self.assertFalse(result)
+
+
+class EscalationAnalysisHookTests(TestCase):
+    """_upsert_replies' escalation-analysis hook -- pure DB state, no mocking needed
+    (unlike S3ArchiveHookTests/archive_reply, this hook never leaves Python)."""
+
+    def setUp(self):
+        self.project = make_project(escalation_analysis_enabled=True)
+
+    def _ticket(self, whmcs_ticket_id=1, tid="T-1", status="Open"):
+        return TicketSnapshot.objects.create(
+            project=self.project, whmcs_ticket_id=whmcs_ticket_id, tid=tid, status=status,
+            opened_at=timezone.now(),
+        )
+
+    def _reply_payload(self, replyid=1):
+        return {"reply": [{
+            "replyid": replyid, "date": "2026-01-01 10:00:00", "requestor_type": "Operator",
+            "name": "Bob", "message": "hi",
+        }]}
+
+    def test_new_reply_on_toggled_on_open_ticket_queues_analysis(self):
+        ticket = self._ticket()
+        _upsert_replies(self.project, ticket, self._reply_payload())
+
+        analysis = TicketEscalationAnalysis.objects.get(ticket=ticket)
+        self.assertEqual(analysis.status, TicketEscalationAnalysis.STATUS_QUEUED)
+
+    def test_toggle_off_means_never_queued(self):
+        self.project.escalation_analysis_enabled = False
+        self.project.save(update_fields=["escalation_analysis_enabled"])
+        ticket = self._ticket()
+
+        _upsert_replies(self.project, ticket, self._reply_payload())
+
+        self.assertFalse(TicketEscalationAnalysis.objects.filter(ticket=ticket).exists())
+
+    def test_closed_ticket_is_never_queued(self):
+        # Including the specific case of the reply that JUST closed it -- by the
+        # time _upsert_replies runs, ticket.status already reflects the fresh
+        # sync's value (set by _sync_one_ticket before calling this).
+        ticket = self._ticket(status="Closed")
+        _upsert_replies(self.project, ticket, self._reply_payload())
+        self.assertFalse(TicketEscalationAnalysis.objects.filter(ticket=ticket).exists())
+
+    def test_existing_done_row_flips_back_to_queued_on_a_new_reply(self):
+        # The "stays current as the conversation evolves" behavior: a ticket that
+        # was already analyzed gets re-queued, not left stale, the next time its
+        # thread genuinely changes.
+        ticket = self._ticket()
+        TicketEscalationAnalysis.objects.create(
+            ticket=ticket, status=TicketEscalationAnalysis.STATUS_DONE,
+            sentiment_category=TicketEscalationAnalysis.SENTIMENT_HEALTHY, escalation_risk_score=5,
+        )
+
+        _upsert_replies(self.project, ticket, self._reply_payload())
+
+        analysis = TicketEscalationAnalysis.objects.get(ticket=ticket)
+        self.assertEqual(analysis.status, TicketEscalationAnalysis.STATUS_QUEUED)
+        self.assertEqual(TicketEscalationAnalysis.objects.filter(ticket=ticket).count(), 1)
+
+    def test_a_different_toggled_off_projects_ticket_is_untouched(self):
+        other_project = make_project("Off Project", escalation_analysis_enabled=False)
+        other_ticket = TicketSnapshot.objects.create(
+            project=other_project, whmcs_ticket_id=2, tid="T-2", status="Open", opened_at=timezone.now(),
+        )
+
+        _upsert_replies(other_project, other_ticket, self._reply_payload())
+
+        self.assertFalse(TicketEscalationAnalysis.objects.filter(ticket=other_ticket).exists())
+
+
+class SyncTicketsWatermarkTests(TestCase):
+    """sync_tickets' incremental watermark (Addendum 10) -- derived from
+    MAX(TicketSnapshot.last_reply_at), not a separately-persisted field. Mocks
+    WHMCSClient entirely (sync_tickets constructs its own instance internally, same
+    as RefreshTicketRepliesTests above), asserting only what iter_tickets was called
+    with -- the rest of sync_tickets' per-ticket behavior is already covered
+    elsewhere in this file."""
+
+    def setUp(self):
+        self.project = make_project()
+
+    @patch("audit.sync.WHMCSClient")
+    def test_no_existing_tickets_means_no_watermark(self, mock_client_cls):
+        mock_instance = Mock()
+        mock_instance.iter_tickets.return_value = iter([])
+        mock_client_cls.return_value = mock_instance
+
+        sync_tickets(self.project)
+
+        mock_instance.iter_tickets.assert_called_once_with(stop_at_lastreply=None)
+
+    @patch("audit.sync.WHMCSClient")
+    def test_watermark_is_the_latest_stored_last_reply_at_ist_formatted(self, mock_client_cls):
+        older = timezone.datetime(2026, 1, 1, 10, 0, 0, tzinfo=dt_timezone.utc)
+        newer = timezone.datetime(2026, 1, 5, 10, 0, 0, tzinfo=dt_timezone.utc)
+        TicketSnapshot.objects.create(
+            project=self.project, whmcs_ticket_id=1, tid="T-1", status="Open",
+            opened_at=older, last_reply_at=older,
+        )
+        TicketSnapshot.objects.create(
+            project=self.project, whmcs_ticket_id=2, tid="T-2", status="Open",
+            opened_at=newer, last_reply_at=newer,
+        )
+        mock_instance = Mock()
+        mock_instance.iter_tickets.return_value = iter([])
+        mock_client_cls.return_value = mock_instance
+
+        sync_tickets(self.project)
+
+        # 2026-01-05 10:00:00 UTC -> 2026-01-05 15:30:00 IST (UTC+5:30)
+        mock_instance.iter_tickets.assert_called_once_with(stop_at_lastreply="2026-01-05 15:30:00")
+
+    @patch("audit.sync.WHMCSClient")
+    def test_watermark_ignores_a_different_projects_tickets(self, mock_client_cls):
+        other_project = make_project("Other Project")
+        TicketSnapshot.objects.create(
+            project=other_project, whmcs_ticket_id=1, tid="T-1", status="Open",
+            opened_at=timezone.now(), last_reply_at=timezone.now(),
+        )
+        mock_instance = Mock()
+        mock_instance.iter_tickets.return_value = iter([])
+        mock_client_cls.return_value = mock_instance
+
+        sync_tickets(self.project)
+
+        mock_instance.iter_tickets.assert_called_once_with(stop_at_lastreply=None)

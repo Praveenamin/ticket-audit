@@ -10,7 +10,7 @@ from django.core.management import call_command
 from django.utils import timezone
 
 from audit.closed_ticket_summary import queue_recent_closed_tickets
-from audit.models import ClosedTicketSummary, DumpUpload, TicketAudit
+from audit.models import ClosedTicketSummary, DumpUpload, TicketAudit, TicketEscalationAnalysis
 
 running = True
 
@@ -31,12 +31,16 @@ dump_import_interval = 30  # check for a queued dump upload every 30 seconds
 ai_audit_interval = 30  # check for a queued AI ticket audit every 30 seconds
 closed_ticket_summary_interval = 30  # check for newly-closed tickets / a queued summary every 30 seconds
 s3_archive_retry_interval = 120  # retry any failed S3 archive uploads every 2 minutes
+escalation_analysis_interval = 30  # check for a queued escalation analysis every 30 seconds
+sla_refresh_interval = 300  # re-evaluate open tickets' SLA every 5 min -- pure local DB, no WHMCS/Ollama calls
 
 last_sync = timezone.now()
 last_dump_import_check = timezone.now()
 last_ai_audit_check = timezone.now()
 last_closed_ticket_summary_check = timezone.now()
 last_s3_archive_retry_check = timezone.now()
+last_escalation_analysis_check = timezone.now()
+last_sla_refresh_check = timezone.now()
 
 while running:
     try:
@@ -124,6 +128,41 @@ while running:
                 last_s3_archive_retry_check = timezone.now()
             except Exception as e:
                 print(f"Error retrying S3 archive: {str(e)}")
+
+        # Auto-queued directly by sync.py's _upsert_replies hook whenever an
+        # eligible project's non-Closed ticket gets a new reply -- no periodic
+        # queue-scan needed here, just pick the oldest queued one, same accepted
+        # tradeoff as every other job in this loop.
+        time_since_last_escalation_analysis = (timezone.now() - last_escalation_analysis_check).total_seconds()
+        if time_since_last_escalation_analysis >= escalation_analysis_interval:
+            try:
+                queued = TicketEscalationAnalysis.objects.filter(
+                    status=TicketEscalationAnalysis.STATUS_QUEUED
+                ).order_by("queued_at").first()
+                if queued:
+                    print(
+                        f"[{timezone.now().strftime('%Y-%m-%d %H:%M:%S')}] "
+                        f"Running escalation analysis {queued.id} (ticket {queued.ticket_id})..."
+                    )
+                    call_command("run_escalation_analysis", analysis_id=queued.id)
+                    print(f"Escalation analysis {queued.id} processed.")
+                last_escalation_analysis_check = timezone.now()
+            except Exception as e:
+                print(f"Error processing escalation analysis: {str(e)}")
+
+        # Now that the WHMCS ticket listing itself is incremental (Addendum 10), a
+        # quiet, still-open, unanswered ticket may go many sync passes without WHMCS
+        # ever reporting a change -- this keeps its SLA status re-evaluated against
+        # the live clock anyway (a real breach can trip purely from elapsed time,
+        # with zero new WHMCS data). No WHMCS/Ollama calls at all, so this can and
+        # should run far more often than the sync itself.
+        time_since_last_sla_refresh = (timezone.now() - last_sla_refresh_check).total_seconds()
+        if time_since_last_sla_refresh >= sla_refresh_interval:
+            try:
+                call_command("recompute_sla", open_only=True)
+                last_sla_refresh_check = timezone.now()
+            except Exception as e:
+                print(f"Error refreshing SLA: {str(e)}")
     except Exception as e:
         print(f"Error: {str(e)}")
 

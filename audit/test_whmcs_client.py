@@ -89,3 +89,67 @@ class WHMCSClientCallTests(SimpleTestCase):
 
         with self.assertRaises(WHMCSAPIError):
             make_client().call("GetTickets")
+
+
+def _tickets_response(tickets, totalresults=None):
+    return {
+        "result": "success",
+        "totalresults": totalresults if totalresults is not None else len(tickets),
+        "tickets": {"ticket": tickets},
+    }
+
+
+class IterTicketsTests(SimpleTestCase):
+    """iter_tickets' own pagination/early-stop logic -- mocks get_tickets_page
+    directly (not requests.post) so each test controls page contents precisely
+    without needing a second layer of JSON-shaped fixtures."""
+
+    def test_no_watermark_walks_every_ticket_no_forced_ordering(self):
+        client = make_client()
+        page1 = _tickets_response(
+            [{"id": 1, "lastreply": "2026-01-01 00:00:00"}], totalresults=2,
+        )
+        page2 = _tickets_response(
+            [{"id": 2, "lastreply": "2020-01-01 00:00:00"}], totalresults=2,
+        )
+        with patch.object(client, "get_tickets_page", side_effect=[page1, page2]) as mock_page:
+            tickets = list(client.iter_tickets(page_size=1))
+
+        self.assertEqual([t["id"] for t in tickets], [1, 2])
+        for call in mock_page.call_args_list:
+            self.assertNotIn("orderby", call.kwargs)
+            self.assertNotIn("order", call.kwargs)
+
+    def test_watermark_given_requests_ordering(self):
+        client = make_client()
+        with patch.object(client, "get_tickets_page", return_value=_tickets_response([])) as mock_page:
+            list(client.iter_tickets(stop_at_lastreply="2026-01-01 00:00:00"))
+
+        mock_page.assert_called_once_with(limitstart=0, limitnum=100, orderby="lastreply", order="desc")
+
+    def test_stops_after_yielding_tickets_at_or_above_watermark(self):
+        client = make_client()
+        page = _tickets_response([
+            {"id": 1, "lastreply": "2026-01-03 00:00:00"},  # above watermark
+            {"id": 2, "lastreply": "2026-01-02 00:00:00"},  # exactly at watermark -- still yielded
+            {"id": 3, "lastreply": "2026-01-01 00:00:00"},  # strictly below -- stop here
+            {"id": 4, "lastreply": "2020-01-01 00:00:00"},  # never reached
+        ])
+        with patch.object(client, "get_tickets_page", return_value=page):
+            tickets = list(client.iter_tickets(stop_at_lastreply="2026-01-02 00:00:00"))
+
+        self.assertEqual([t["id"] for t in tickets], [1, 2])
+
+    def test_default_page_size_is_100(self):
+        client = make_client()
+        with patch.object(client, "get_tickets_page", return_value=_tickets_response([])) as mock_page:
+            list(client.iter_tickets())
+
+        self.assertEqual(mock_page.call_args.kwargs["limitnum"], 100)
+
+    def test_explicit_page_size_override_respected(self):
+        client = make_client()
+        with patch.object(client, "get_tickets_page", return_value=_tickets_response([])) as mock_page:
+            list(client.iter_tickets(page_size=10))
+
+        self.assertEqual(mock_page.call_args.kwargs["limitnum"], 10)

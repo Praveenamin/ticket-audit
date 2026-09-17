@@ -44,6 +44,14 @@ class Project(models.Model):
     s3_access_key_id = models.CharField(max_length=255, blank=True)
     s3_secret_access_key = models.CharField(max_length=255, blank=True)
     s3_region = models.CharField(max_length=50, blank=True)
+    escalation_analysis_enabled = models.BooleanField(
+        default=False,
+        help_text="When on, every non-Closed ticket in this project gets an automatic "
+        "sentiment/escalation-risk analysis (TicketEscalationAnalysis) re-run every "
+        "time its reply thread changes, via sync.py's own hook -- no manual trigger, "
+        "no backfill of existing tickets when first turned on (only tickets that get a "
+        "new reply from that point onward are analyzed).",
+    )
     created_at = models.DateTimeField(auto_now_add=True)
 
     class Meta:
@@ -337,6 +345,86 @@ class TicketAudit(models.Model):
 
     def __str__(self):
         return f"AI audit of ticket {self.ticket_id} ({self.status})"
+
+
+class TicketEscalationAnalysis(models.Model):
+    """Automatic, ongoing customer-escalation-risk radar -- distinct from TicketAudit
+    above (a manual, on-demand audit of the AGENT's performance). One row PER TICKET
+    (OneToOneField, like ClosedTicketSummary), re-evaluated and updated in place every
+    time the ticket's reply thread changes (see sync.py's _upsert_replies hook) so the
+    score stays current as a conversation evolves -- not an immutable per-run log like
+    TicketAudit, since there's exactly one "current" risk assessment to track."""
+
+    STATUS_QUEUED = "queued"
+    STATUS_PROCESSING = "processing"
+    STATUS_DONE = "done"
+    STATUS_NEEDS_REVIEW = "needs_review"
+    STATUS_FAILED = "failed"
+    STATUS_CHOICES = [
+        (STATUS_QUEUED, "Queued"),
+        (STATUS_PROCESSING, "Processing"),
+        (STATUS_DONE, "Done"),
+        (STATUS_NEEDS_REVIEW, "Needs review"),
+        (STATUS_FAILED, "Failed"),
+    ]
+
+    SENTIMENT_CRITICAL = "critical"
+    SENTIMENT_FRUSTRATED = "frustrated"
+    SENTIMENT_HEALTHY = "healthy"
+    SENTIMENT_CHOICES = [
+        (SENTIMENT_CRITICAL, "🔴 Critical (Near Escalation)"),
+        (SENTIMENT_FRUSTRATED, "🟡 Frustrated (Not Happy)"),
+        (SENTIMENT_HEALTHY, "🟢 Healthy (Satisfied)"),
+    ]
+
+    DRIVER_DOWNTIME = "downtime"
+    DRIVER_SLOW_RESPONSE = "slow_response"
+    DRIVER_UNRESOLVED_LOOP = "unresolved_technical_loop"
+    DRIVER_BILLING_ISSUE = "billing_issue"
+    DRIVER_REPEATED_ESCALATION = "repeated_escalation"
+    DRIVER_MISCOMMUNICATION = "miscommunication"
+    DRIVER_OTHER = "other"
+    DRIVER_CHOICES = [
+        (DRIVER_DOWNTIME, "Downtime"),
+        (DRIVER_SLOW_RESPONSE, "Slow Response"),
+        (DRIVER_UNRESOLVED_LOOP, "Unresolved Technical Loop"),
+        (DRIVER_BILLING_ISSUE, "Billing Issue"),
+        (DRIVER_REPEATED_ESCALATION, "Repeated Escalation"),
+        (DRIVER_MISCOMMUNICATION, "Miscommunication"),
+        (DRIVER_OTHER, "Other"),
+    ]
+
+    ticket = models.OneToOneField(TicketSnapshot, on_delete=models.CASCADE, related_name="escalation_analysis")
+    status = models.CharField(max_length=20, choices=STATUS_CHOICES, default=STATUS_QUEUED)
+
+    queued_at = models.DateTimeField(auto_now_add=True)
+    started_at = models.DateTimeField(null=True, blank=True)
+    finished_at = models.DateTimeField(null=True, blank=True)
+    model_used = models.CharField(
+        max_length=100, blank=True,
+        help_text="Snapshot of settings.OLLAMA_MODEL at run time, same _at_eval-snapshot idea as elsewhere in this app.",
+    )
+
+    sentiment_category = models.CharField(max_length=20, choices=SENTIMENT_CHOICES, blank=True)
+    escalation_risk_score = models.PositiveSmallIntegerField(
+        null=True, blank=True, help_text="0-100 -- 0 means no risk of escalation, 100 means about to escalate/churn.",
+    )
+    frustration_driver = models.CharField(
+        max_length=30, choices=DRIVER_CHOICES, blank=True,
+        help_text="Blank only when sentiment_category is 'healthy' -- there's no frustration driver for a satisfied ticket.",
+    )
+    justification = models.TextField(blank=True, help_text="1-sentence reason for the score, drafted by the LLM.")
+
+    raw_response = models.TextField(
+        blank=True, help_text="Full Ollama reply, kept for debugging needs_review/failed rows.",
+    )
+    error_message = models.TextField(blank=True)
+
+    class Meta:
+        verbose_name_plural = "Ticket escalation analyses"
+
+    def __str__(self):
+        return f"Escalation analysis of ticket {self.ticket_id} ({self.status})"
 
 
 class ClosedTicketSummary(models.Model):
